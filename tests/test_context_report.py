@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -797,6 +798,61 @@ class ReportTest(unittest.TestCase):
         corrupt.write_text("{not valid json")
         r_fallback = self.report("--model-catalog", str(corrupt))
         self.assertEqual(r_fallback["limit_tokens"], 1_048_576)
+
+    def test_closed_wal_db_without_shm(self):
+        # Cleanly closed WAL databases keep WAL header bytes (2, 2) but have no
+        # -wal/-shm sidecar files, which causes plain `?mode=ro` to fail.
+        self.db.conn.commit()
+        self.db.conn.execute("PRAGMA journal_mode=WAL")
+        self.db.step(14, payload_field=19, payload=user_input("hello from closed WAL"))
+        self.db.generation([group(7, 1234, ("0: USER_INPUT", 1234))])
+        self.db.conn.commit()
+        self.db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self.db.close()
+
+        for suf in ("-wal", "-shm"):
+            p = Path(f"{self.db_path}{suf}")
+            if p.exists():
+                p.unlink()
+
+        with open(self.db_path, "rb") as fh:
+            self.assertEqual(fh.read(20)[18:20], b"\x02\x02")
+        self.assertFalse(Path(f"{self.db_path}-wal").exists())
+        self.assertFalse(Path(f"{self.db_path}-shm").exists())
+
+        rep = self.report()
+        self.assertEqual(rep["used_tokens"], 1234)
+
+    def test_wal_db_with_uncheckpointed_wal_and_no_shm(self):
+        # Active WAL DB copied without -shm (or in a dir where -shm cannot be
+        # created): must preserve uncheckpointed frames in the -wal file.
+        self.db.conn.execute("PRAGMA journal_mode=WAL")
+        self.db.conn.execute("PRAGMA wal_autocheckpoint=0")
+        self.db.step(14, payload_field=19, payload=user_input("initial"))
+        self.db.generation([group(7, 500, ("0: USER_INPUT", 500))])
+        self.db.conn.commit()
+        self.db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+        # Write a second generation strictly into -wal without checkpointing.
+        self.db.step(14, payload_field=19, payload=user_input("in wal only"))
+        self.db.generation([group(7, 4321, ("0: USER_INPUT", 4321))])
+        self.db.conn.commit()
+
+        wal_only_dir = Path(self.tmp.name) / "wal_only"
+        wal_only_dir.mkdir()
+        copied_db = wal_only_dir / self.db_path.name
+        shutil.copyfile(self.db_path, copied_db)
+        shutil.copyfile(Path(f"{self.db_path}-wal"), Path(f"{copied_db}-wal"))
+        self.db.close()
+
+        self.assertTrue(Path(f"{copied_db}-wal").stat().st_size > 0)
+        self.assertFalse(Path(f"{copied_db}-shm").exists())
+
+        steps, gen, _, _, _ = context_report.load_db(copied_db)
+        self.assertEqual(len(steps), 2)
+        self.assertIsNotNone(gen)
+        st = context_report.collect_stats(steps, gen, 1_000_000)
+        self.assertEqual(st["total"], 4321)
 
 
 class FormatTest(unittest.TestCase):

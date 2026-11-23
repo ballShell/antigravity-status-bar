@@ -14,8 +14,10 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 from urllib.parse import quote, unquote, urlparse
 
@@ -170,13 +172,14 @@ def go_div4(n: int) -> int:
     return int(n / 4)
 
 
-def sqlite_ro_uri(path: Path) -> str:
+def sqlite_ro_uri(path: Path, immutable: bool = False) -> str:
     """Build a percent-encoded SQLite read-only URI safe for #, ?, %, spaces, drive letters, and UNC shares."""
     abs_p = Path(os.path.abspath(os.fspath(path)))
     posix_p = abs_p.as_posix()
+    suffix = "?mode=ro&immutable=1" if immutable else "?mode=ro"
     if posix_p.startswith("//"):
-        return "file:////" + quote(posix_p.lstrip("/"), safe="/:") + "?mode=ro"
-    return abs_p.as_uri() + "?mode=ro"
+        return "file:////" + quote(posix_p.lstrip("/"), safe="/:") + suffix
+    return abs_p.as_uri() + suffix
 
 
 def uri_to_path(uri: str) -> str:
@@ -803,21 +806,65 @@ def _safe_max_tokens(val) -> int:
     return 0
 
 
-def _sqlite_connect_ro(db_path: Path) -> sqlite3.Connection:
-    uri = sqlite_ro_uri(db_path)
+def _has_nonempty_wal(db_path: Path) -> bool:
+    wal = Path(f"{db_path}-wal")
+    try:
+        return wal.is_file() and wal.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _query_ro_db(db_path: Path, fn):
+    """Run read-only query callback ``fn(conn)`` with busy retries and WAL no-shm fallbacks.
+
+    Opening a WAL-mode SQLite DB with ``?mode=ro`` fails with
+    ``OperationalError: unable to open database file`` when no ``-shm`` file
+    exists (e.g. cleanly closed historical conversations) or when the process
+    cannot create/write ``-shm``.
+    """
     last_err: sqlite3.Error | None = None
     for attempt in range(3):
+        conn = None
         try:
-            return sqlite3.connect(uri, uri=True, timeout=1.5)
+            conn = sqlite3.connect(sqlite_ro_uri(db_path), uri=True, timeout=1.5)
+            return fn(conn)
         except sqlite3.OperationalError as exc:
             last_err = exc
             msg = str(exc).lower()
             if ("locked" in msg or "busy" in msg) and attempt < 2:
                 time.sleep(0.05 * (attempt + 1))
                 continue
+            if "unable to open database file" in msg:
+                break
             raise
-    assert last_err is not None
-    raise last_err
+        finally:
+            if conn is not None:
+                conn.close()
+    else:
+        assert last_err is not None
+        raise last_err
+
+    if not _has_nonempty_wal(db_path):
+        conn = sqlite3.connect(sqlite_ro_uri(db_path, immutable=True), uri=True)
+        try:
+            return fn(conn)
+        finally:
+            conn.close()
+
+    with tempfile.TemporaryDirectory(prefix="ag-status-bar-") as tmpdir:
+        tmp_db = Path(tmpdir) / db_path.name
+        shutil.copyfile(db_path, tmp_db)
+        wal = Path(f"{db_path}-wal")
+        if wal.is_file():
+            try:
+                shutil.copyfile(wal, Path(f"{tmp_db}-wal"))
+            except FileNotFoundError:
+                pass
+        conn = sqlite3.connect(tmp_db)
+        try:
+            return fn(conn)
+        finally:
+            conn.close()
 
 
 def _subagent_db_status(db_path: Path | None, sub_conv_id: str) -> str:
@@ -827,11 +874,10 @@ def _subagent_db_status(db_path: Path | None, sub_conv_id: str) -> str:
     if not sub_db.is_file():
         return "unknown"
     try:
-        conn = _sqlite_connect_ro(sub_db)
-        try:
-            rows = conn.execute("SELECT status FROM steps ORDER BY idx DESC LIMIT 5").fetchall()
-        finally:
-            conn.close()
+        rows = _query_ro_db(
+            sub_db,
+            lambda conn: conn.execute("SELECT status FROM steps ORDER BY idx DESC LIMIT 5").fetchall(),
+        )
     except sqlite3.Error:
         return "unknown"
     if not rows:
@@ -1247,57 +1293,40 @@ def collect_model_usage(gens: list[Msg], catalog: dict | None = None) -> list[di
 
 
 def load_db(db_path: Path, catalog: dict | None = None) -> tuple[list[Step], Msg | None, dict, dict, list[dict]]:
-    last_err: sqlite3.Error | None = None
-    rows: list[tuple] = []
-    gen_rows: list[tuple] = []
-    col_names: set[str] = set()
-    for attempt in range(3):
-        conn = _sqlite_connect_ro(db_path)
-        try:
-            conn.execute("BEGIN")
-            step_cols = [r[1] for r in conn.execute("PRAGMA table_info(steps)").fetchall()]
-            if not step_cols:
-                raise RuntimeError("Unsupported conversation database schema: missing steps table")
-            col_names = set(step_cols)
-            has_task_details = "task_details" in col_names
-            has_error_details = "error_details" in col_names
-            select_cols = [
-                "idx" if "idx" in col_names else "rowid",
-                "step_type" if "step_type" in col_names else "0",
-                "status" if "status" in col_names else "0",
-                "metadata" if "metadata" in col_names else "NULL",
-                "step_payload" if "step_payload" in col_names else "NULL",
-                "task_details" if has_task_details else "NULL",
-                "error_details" if has_error_details else "NULL",
-            ]
-            rows = conn.execute(f"SELECT {', '.join(select_cols)} FROM steps ORDER BY 1").fetchall()
-            has_gen = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='gen_metadata'"
-            ).fetchone()
-            if has_gen:
-                gen_cols = {r[1] for r in conn.execute("PRAGMA table_info(gen_metadata)").fetchall()}
-                if "data" in gen_cols:
-                    order_col = "idx" if "idx" in gen_cols else "rowid"
-                    gen_rows = conn.execute(f"SELECT data FROM gen_metadata ORDER BY {order_col}").fetchall()
-                else:
-                    gen_rows = []
+    def _read(conn: sqlite3.Connection):
+        conn.execute("BEGIN")
+        step_cols = [r[1] for r in conn.execute("PRAGMA table_info(steps)").fetchall()]
+        if not step_cols:
+            raise RuntimeError("Unsupported conversation database schema: missing steps table")
+        col_names = set(step_cols)
+        has_task_details = "task_details" in col_names
+        has_error_details = "error_details" in col_names
+        select_cols = [
+            "idx" if "idx" in col_names else "rowid",
+            "step_type" if "step_type" in col_names else "0",
+            "status" if "status" in col_names else "0",
+            "metadata" if "metadata" in col_names else "NULL",
+            "step_payload" if "step_payload" in col_names else "NULL",
+            "task_details" if has_task_details else "NULL",
+            "error_details" if has_error_details else "NULL",
+        ]
+        rows = conn.execute(f"SELECT {', '.join(select_cols)} FROM steps ORDER BY 1").fetchall()
+        has_gen = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='gen_metadata'"
+        ).fetchone()
+        if has_gen:
+            gen_cols = {r[1] for r in conn.execute("PRAGMA table_info(gen_metadata)").fetchall()}
+            if "data" in gen_cols:
+                order_col = "idx" if "idx" in gen_cols else "rowid"
+                gen_rows = conn.execute(f"SELECT data FROM gen_metadata ORDER BY {order_col}").fetchall()
             else:
                 gen_rows = []
-            conn.rollback()
-            last_err = None
-            break
-        except sqlite3.OperationalError as exc:
-            last_err = exc
-            msg = str(exc).lower()
-            if ("locked" in msg or "busy" in msg) and attempt < 2:
-                time.sleep(0.05 * (attempt + 1))
-                continue
-            raise
-        finally:
-            conn.close()
-    if last_err is not None:
-        raise last_err
+        else:
+            gen_rows = []
+        conn.rollback()
+        return rows, gen_rows
 
+    rows, gen_rows = _query_ro_db(db_path, _read)
     steps = [
         Step(pos, r[4] or b"", r[1], r[2], r[3], idx=r[0], task_details=r[5], error_details=r[6])
         for pos, r in enumerate(rows)
