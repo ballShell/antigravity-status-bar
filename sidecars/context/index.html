@@ -20,10 +20,10 @@
     --fg: var(--foreground, #e3e3e3);
     --dim: var(--muted-foreground, #9aa0a6);
     --line: var(--border, rgba(127, 127, 127, .25));
-    --surface: color-mix(in srgb, var(--fg) 4%, transparent);
-    --surface-hover: color-mix(in srgb, var(--fg) 7%, transparent);
-    --code-bg: color-mix(in srgb, var(--fg) 5%, transparent);
-    --empty: color-mix(in srgb, var(--dim) 24%, transparent);
+    --surface: rgba(127, 127, 127, .06);
+    --surface-hover: rgba(127, 127, 127, .10);
+    --code-bg: rgba(127, 127, 127, .08);
+    --empty: rgba(127, 127, 127, .24);
   }
   * { box-sizing: border-box; }
   body {
@@ -36,12 +36,12 @@
   ::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
   ::-webkit-scrollbar-button { display: none; }
   ::-webkit-scrollbar-thumb {
-    background: color-mix(in srgb, var(--dim) 30%, transparent);
+    background: rgba(127, 127, 127, .30);
     border: 3px solid transparent;
     border-radius: 999px;
     background-clip: padding-box;
   }
-  ::-webkit-scrollbar-thumb:hover { background-color: color-mix(in srgb, var(--dim) 55%, transparent); }
+  ::-webkit-scrollbar-thumb:hover { background-color: rgba(127, 127, 127, .55); }
 
   /* preload.js zeroes the body's padding, so the page padding lives here */
   main { padding: 12px 14px 18px; }
@@ -85,7 +85,7 @@
     top: -2px;
     bottom: -2px;
     width: 1.5px;
-    background: color-mix(in srgb, var(--fg) 75%, transparent);
+    background: rgba(200, 200, 200, .75);
     border-radius: 1px;
     cursor: help;
     z-index: 2;
@@ -130,8 +130,11 @@
   .note { font-size: 12px; color: var(--dim); margin: -2px 0 8px; }
   .group + .group { margin-top: 8px; }
   .row {
-    display: grid; grid-template-columns: 10px 1fr auto 46px; align-items: center; gap: 8px; padding: 2.5px 0;
+    display: grid; grid-template-columns: 10px minmax(0, 1fr) auto 46px; align-items: center; gap: 8px; padding: 2.5px 0;
     transition: opacity .15s ease;
+  }
+  .row > span:nth-child(2) {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .row.is-dimmed { opacity: .38; }
   .row.is-highlighted { opacity: 1; }
@@ -173,22 +176,22 @@
   }
   .status-pill.running {
     color: var(--c-running);
-    border-color: color-mix(in srgb, var(--c-running) 40%, transparent);
-    background: color-mix(in srgb, var(--c-running) 10%, transparent);
+    border-color: rgba(63, 185, 80, .4);
+    background: rgba(63, 185, 80, .1);
   }
   .status-dot {
     width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--dim);
   }
   .status-dot.running {
     background: var(--c-running);
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--c-running) 70%, transparent);
+    box-shadow: 0 0 0 0 rgba(63, 185, 80, .7);
     animation: pulse 1.8s infinite;
   }
   .status-dot.done { background: var(--c-done); }
   .status-dot.error { background: var(--c-error); }
   .status-dot.cancelled, .status-dot.unknown { background: var(--c-cancelled); }
   @keyframes pulse {
-    0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--c-running) 60%, transparent); }
+    0% { box-shadow: 0 0 0 0 rgba(63, 185, 80, .6); }
     70% { box-shadow: 0 0 0 5px transparent; }
     100% { box-shadow: 0 0 0 0 transparent; }
   }
@@ -202,7 +205,7 @@
     overflow: hidden;
   }
   .task-card.is-running {
-    border-color: color-mix(in srgb, var(--c-running) 35%, var(--line));
+    border-color: rgba(63, 185, 80, .35);
   }
   .task-toggle {
     width: 100%;
@@ -235,9 +238,9 @@
     color: var(--dim);
     flex: none;
   }
-  .tag.daemon { color: var(--c-agent); border-color: color-mix(in srgb, var(--c-agent) 40%, transparent); }
-  .tag.timer { color: var(--c-tool); border-color: color-mix(in srgb, var(--c-tool) 40%, transparent); }
-  .tag.subagent { color: var(--c-user); border-color: color-mix(in srgb, var(--c-user) 40%, transparent); }
+  .tag.daemon { color: var(--c-agent); border-color: rgba(163, 113, 247, .4); }
+  .tag.timer { color: var(--c-tool); border-color: rgba(227, 160, 8, .4); }
+  .tag.subagent { color: var(--c-user); border-color: rgba(88, 166, 255, .4); }
   .task-time { font-size: 11px; color: var(--dim); flex: none; }
   .chevron {
     font-size: 10px; color: var(--dim); flex: none;
@@ -259,6 +262,7 @@
     font-size: 11px;
     color: var(--dim);
   }
+  .task-meta-item { min-width: 0; overflow-wrap: anywhere; }
   .task-meta-item strong { color: var(--fg); font-weight: 500; }
   .task-block-head {
     display: flex;
@@ -287,13 +291,35 @@
   .code-box.log-box { max-height: 220px; }
   .tasks-more { margin-top: 7px; display: flex; justify-content: center; }
 
-  .files li { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 3px 0; }
+  .files li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding: 3px 0; }
   .files .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .files .dir { display: block; font-size: 11.5px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
   .files .tok { color: var(--dim); font-size: 12px; align-self: start; }
   ul { list-style: none; margin: 0; padding: 0; }
   .ck-main { display: flex; justify-content: space-between; gap: 8px; }
-  .badge { font-size: 11px; color: var(--c-running); border: 1px solid color-mix(in srgb, var(--c-running) 40%, transparent); border-radius: 999px; padding: 0 7px; white-space: nowrap; }
+  .badge { font-size: 11px; color: var(--c-running); border: 1px solid rgba(63, 185, 80, .4); border-radius: 999px; padding: 0 7px; white-space: nowrap; }
+
+  @supports (color: color-mix(in srgb, white, black)) {
+    :root {
+      --surface: color-mix(in srgb, var(--fg) 4%, transparent);
+      --surface-hover: color-mix(in srgb, var(--fg) 7%, transparent);
+      --code-bg: color-mix(in srgb, var(--fg) 5%, transparent);
+      --empty: color-mix(in srgb, var(--dim) 24%, transparent);
+    }
+    ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--dim) 30%, transparent); }
+    ::-webkit-scrollbar-thumb:hover { background-color: color-mix(in srgb, var(--dim) 55%, transparent); }
+    .ctx-budget-tick { background: color-mix(in srgb, var(--fg) 75%, transparent); }
+    .status-pill.running {
+      border-color: color-mix(in srgb, var(--c-running) 40%, transparent);
+      background: color-mix(in srgb, var(--c-running) 10%, transparent);
+    }
+    .status-dot.running { box-shadow: 0 0 0 0 color-mix(in srgb, var(--c-running) 70%, transparent); }
+    .task-card.is-running { border-color: color-mix(in srgb, var(--c-running) 35%, var(--line)); }
+    .tag.daemon { border-color: color-mix(in srgb, var(--c-agent) 40%, transparent); }
+    .tag.timer { border-color: color-mix(in srgb, var(--c-tool) 40%, transparent); }
+    .tag.subagent { border-color: color-mix(in srgb, var(--c-user) 40%, transparent); }
+    .badge { border-color: color-mix(in srgb, var(--c-running) 40%, transparent); }
+  }
 
   .empty { margin: 48px 8px; text-align: center; color: var(--dim); }
   footer { margin-top: 16px; font-size: 11px; color: var(--dim); display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
@@ -341,11 +367,36 @@
   let workspace = '';
   let report = null;
   let lastJson = '';
+  let reportSeq = 0;
+  let reportController = null;
+  let reportInFlightKey = null;
   const expandedTaskIds = new Set();
   const taskLogs = new Map(); // step_idx -> { loading, data, error }
+  const taskLogSeq = new Map(); // step_idx -> latest seq
+  const taskLogControllers = new Map(); // step_idx -> { ctrl, startedSeq }
+  const prevTaskStatuses = new Map(); // step_idx -> previous status string
+  const pendingFinalLogAt = new Map(); // step_idx -> reportSeq when task left running
   let showFinishedTasks = false;
 
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const num = (v, fb = 0) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fb;
+  };
+
+  function apiPost(url, payload, signal) {
+    return doFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal,
+    });
+  }
+
+  function setLiveOnline(online) {
+    const dot = document.querySelector('.live');
+    if (dot) dot.classList.toggle('on', Boolean(online));
+  }
 
   function fmtTok(n) {
     if (n >= 1e6) { const v = n / 1e6; return Number.isInteger(v) ? `${v}M` : `${v.toFixed(1)}M`; }
@@ -375,18 +426,28 @@
   }
 
   async function copyText(text, btn, idleLabel) {
+    let copied = false;
     try {
       await navigator.clipboard.writeText(text);
+      copied = true;
     } catch {
       const ta = document.createElement('textarea');
       ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
       document.body.appendChild(ta);
       ta.select();
-      document.execCommand('copy');
-      ta.remove();
+      try {
+        copied = document.execCommand('copy');
+      } catch {
+        copied = false;
+      } finally {
+        ta.remove();
+      }
     }
     if (btn) {
-      btn.textContent = '已复制';
+      btn.textContent = copied ? '已复制' : '复制失败';
       setTimeout(() => { btn.textContent = idleLabel; }, 1500);
     }
   }
@@ -495,7 +556,9 @@
   function taskCardHtml(t) {
     const isExpanded = expandedTaskIds.has(t.step_idx);
     const isSubagent = t.tool === 'invoke_subagent';
-    const statusLabel = STATUS_LABELS[t.status] || t.status;
+    const statusLabel = (t.tool === 'schedule' && t.status === 'done')
+      ? '已调度'
+      : (STATUS_LABELS[t.status] || t.status);
     const title = t.title || t.command || t.task_id || `Task #${t.step_idx}`;
     const badges = [];
     if (t.is_daemon) badges.push('<span class="tag daemon">Daemon</span>');
@@ -654,17 +717,37 @@
   async function fetchTaskLog(stepIdx, force) {
     if (!conversationId) return;
     const prev = taskLogs.get(stepIdx);
+    const neededSeq = pendingFinalLogAt.get(stepIdx) || 0;
+    const active = taskLogControllers.get(stepIdx);
+    // Keep any valid in-flight fetch alive unless user forced or it predates task completion
+    if (!force && active && active.startedSeq >= neededSeq) return;
+
+    const seq = (taskLogSeq.get(stepIdx) || 0) + 1;
+    taskLogSeq.set(stepIdx, seq);
+    if (active && active.ctrl) active.ctrl.abort();
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    const startedSeq = reportSeq;
+    taskLogControllers.set(stepIdx, { ctrl, startedSeq });
+
     if (!prev || force) {
       taskLogs.set(stepIdx, { loading: true, data: prev ? prev.data : null, error: null });
     }
     try {
-      const qs = new URLSearchParams({ conversationId, stepIdx: String(stepIdx) });
-      const res = await doFetch(`/api/task-log?${qs}`);
+      const res = await apiPost('/api/task-log', { conversationId, stepIdx }, ctrl ? ctrl.signal : undefined);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
+      if (taskLogSeq.get(stepIdx) !== seq) return;
       if (data.error) {
         taskLogs.set(stepIdx, { loading: false, data: prev ? prev.data : null, error: data.message || data.error });
       } else {
-        const changed = !prev || !prev.data
+        const finishedSeq = pendingFinalLogAt.get(stepIdx);
+        if (finishedSeq !== undefined && startedSeq >= finishedSeq) {
+          pendingFinalLogAt.delete(stepIdx);
+        }
+        const hadError = Boolean(prev && prev.error);
+        const changed = hadError
+          || !prev
+          || !prev.data
           || prev.data.mtimeMs !== data.mtimeMs
           || prev.data.size !== data.size
           || prev.data.content !== data.content;
@@ -672,7 +755,13 @@
         if (!changed && !force) return;
       }
     } catch (err) {
+      if (err && err.name === 'AbortError') return;
+      if (taskLogSeq.get(stepIdx) !== seq) return;
       taskLogs.set(stepIdx, { loading: false, data: prev ? prev.data : null, error: err.message || 'network error' });
+    } finally {
+      if (taskLogSeq.get(stepIdx) === seq) {
+        taskLogControllers.delete(stepIdx);
+      }
     }
     if (expandedTaskIds.has(stepIdx)) {
       const logEl = document.getElementById(`task-log-${stepIdx}`);
@@ -698,7 +787,7 @@
     const color = CONVERSATION[c.key] || (SYSTEM.has(c.key) ? 'var(--c-system)' : 'var(--c-custom)');
     const shape = CONVERSATION[c.key] ? '' : ' sq';
     return `<div class="row" data-group="${categoryGroup(c.key)}"><span class="mark${shape}" style="background:${color}"></span><span>${esc(c.name)}</span>`
-      + `<span class="tok num">${fmtTok(c.tokens)}</span><span class="p num">${c.pct.toFixed(1)}%</span></div>`;
+      + `<span class="tok num">${fmtTok(num(c.tokens))}</span><span class="p num">${num(c.pct).toFixed(1)}%</span></div>`;
   }
 
   function cacheRateColor(rate) {
@@ -713,16 +802,24 @@
       return '<div class="row cache-row"><span class="mark free"></span><span class="dim">Cache hit</span>'
         + '<span class="tok num dim">-</span><span class="p num">-</span></div>';
     }
-    const rate = cs.last_hit_rate;
-    const color = cacheRateColor(rate);
-    const sessionStr = typeof cs.session_hit_rate === 'number' ? ` · 累计 ${cs.session_hit_rate.toFixed(1)}%` : '';
-    const title = `最近一次: 命中 ${fmtTok(cs.last_cache_read_tokens)} / ${fmtTok(cs.last_total_input_tokens)} (${rate.toFixed(1)}%)`
-      + ` · 会话累计 (${cs.generations} 次调用): 命中 ${fmtTok(cs.session_cache_read_tokens)} / ${fmtTok(cs.session_total_input_tokens)} (${cs.session_hit_rate.toFixed(1)}%)`;
+    const hasLastInput = typeof cs.last_hit_rate === 'number';
+    const rate = hasLastInput ? cs.last_hit_rate : null;
+    const color = hasLastInput ? cacheRateColor(rate) : 'var(--dim)';
+    const rateStr = hasLastInput ? `${rate.toFixed(1)}%` : '-';
+    const sessionRateStr = typeof cs.session_hit_rate === 'number' ? `${cs.session_hit_rate.toFixed(1)}%` : '-';
+    const sessionStr = typeof cs.session_hit_rate === 'number' ? ` · 累计 ${sessionRateStr}` : '';
+    const lastPart = hasLastInput
+      ? `最近一次: 命中 ${fmtTok(num(cs.last_cache_read_tokens))} / ${fmtTok(num(cs.last_total_input_tokens))} (${rateStr})`
+      : '最近一次: 无输入缓存数据';
+    const title = `${lastPart} · 会话累计 (${num(cs.generations)} 次调用): 命中 ${fmtTok(num(cs.session_cache_read_tokens))} / ${fmtTok(num(cs.session_total_input_tokens))} (${sessionRateStr})`;
+    const countsText = hasLastInput
+      ? `${fmtTok(num(cs.last_cache_read_tokens))}/${fmtTok(num(cs.last_total_input_tokens))}`
+      : '-';
     return `<div class="row cache-row" title="${esc(title)}">`
       + `<span class="mark" style="background:${color}"></span>`
       + `<span>Cache hit<span class="cache-sub-inline">${esc(sessionStr)}</span></span>`
-      + `<span class="tok num dim">${fmtTok(cs.last_cache_read_tokens)}/${fmtTok(cs.last_total_input_tokens)}</span>`
-      + `<span class="p num" style="color:${color};font-weight:600">${rate.toFixed(1)}%</span>`
+      + `<span class="tok num dim">${countsText}</span>`
+      + `<span class="p num" style="color:${color};font-weight:600">${rateStr}</span>`
       + `</div>`;
   }
 
@@ -745,13 +842,15 @@
   function categories(r) {
     const conv = r.categories.filter((c) => CONVERSATION[c.key]);
     const rest = r.categories.filter((c) => !CONVERSATION[c.key]);
-    const limit = r.limit_tokens;
-    const freePct = limit ? (r.free_tokens / limit * 100).toFixed(1) : '0.0';
+    const limit = num(r.limit_tokens);
+    const freeTok = num(r.free_tokens);
+    const freePct = limit ? `${(freeTok / limit * 100).toFixed(1)}%` : '-';
+    const freeVal = limit ? fmtTok(freeTok) : 'Unknown';
     const free = `<div class="row"><span class="mark free"></span><span class="dim">Free space</span>`
-      + `<span class="tok num">${fmtTok(r.free_tokens)}</span><span class="p num">${freePct}%</span></div>`;
+      + `<span class="tok num">${freeVal}</span><span class="p num">${freePct}</span></div>`;
     const note = r.heading === 'Token usage by category' ? '' : `<p class="note">${esc(r.heading)}</p>`;
     const buffer = r.checkpoint_buffer
-      ? `<p class="note">Checkpoint buffer: ${fmtTok(r.checkpoint_buffer)} tokens (not counted in usage)</p>` : '';
+      ? `<p class="note">Checkpoint buffer: ${fmtTok(num(r.checkpoint_buffer))} tokens (not counted in usage)</p>` : '';
     return `<section id="token-usage-section"><h2>Token usage</h2>${contextBarHtml(r)}${note}
       <div class="group">${conv.map(categoryRow).join('')}</div>
       ${rest.length ? `<div class="group">${rest.map(categoryRow).join('')}</div>` : ''}
@@ -761,15 +860,16 @@
   function checkpoints(r) {
     const ck = r.checkpoint_view;
     if (!ck) return '';
-    const older = ck.historical ? `<div class="dim" style="font-size:12px">${ck.historical} older checkpoint(s) summarized, not in context</div>` : '';
-    return `<section><h2>Checkpoints <span class="hint">${ck.count} · /rewind</span></h2>
-      <div class="ck-main"><span>Checkpoint ${ck.active_number}: ${esc(ck.active_text)}</span><span class="badge">in context</span></div>${older}</section>`;
+    const older = ck.historical ? `<div class="dim" style="font-size:12px">${num(ck.historical)} older checkpoint(s) summarized, not in context</div>` : '';
+    return `<section><h2>Checkpoints <span class="hint">${num(ck.count)} · /rewind</span></h2>
+      <div class="ck-main"><span>Checkpoint ${num(ck.active_number)}: ${esc(ck.active_text)}</span><span class="badge">in context</span></div>${older}</section>`;
   }
 
   function splitPath(path) {
-    const trimmed = path.replace(/\/$/, '');
+    const norm = String(path || '').replace(/\\/g, '/');
+    const trimmed = norm.replace(/\/$/, '');
     const i = trimmed.lastIndexOf('/');
-    const name = trimmed.slice(i + 1) + (path.endsWith('/') ? '/' : '');
+    const name = trimmed.slice(i + 1) + (norm.endsWith('/') ? '/' : '');
     let dir = i > 0 ? trimmed.slice(0, i) : '';
     if (conversationId) dir = dir.replace(new RegExp(`^.*/brain/${conversationId}`), 'conversation folder');
     return { name, dir };
@@ -788,25 +888,28 @@
   function modelsSectionHtml(r) {
     const models = Array.isArray(r.model_usage) ? r.model_usage : [];
     if (models.length <= 1) return '';
-    const totalCalls = models.reduce((sum, m) => sum + (m.calls || 0), 0);
+    const totalCalls = models.reduce((sum, m) => sum + num(m.calls), 0);
     const barSegs = models.map((m, i) => {
       const color = MODEL_COLORS[i % MODEL_COLORS.length];
-      return `<span class="mseg" style="width:${m.share_pct.toFixed(1)}%;background:${color}" `
-        + `title="${esc(m.model)}: ${fmtTok(m.total_tokens)} tokens (${m.share_pct.toFixed(1)}%)"></span>`;
+      const sharePct = num(m.share_pct);
+      return `<span class="mseg" style="width:${sharePct.toFixed(1)}%;background:${color}" `
+        + `title="${esc(m.model)}: ${fmtTok(num(m.total_tokens))} tokens (${sharePct.toFixed(1)}%)"></span>`;
     }).join('');
     const rows = models.map((m, i) => {
       const color = MODEL_COLORS[i % MODEL_COLORS.length];
+      const calls = num(m.calls);
+      const sharePct = num(m.share_pct);
       const hitStr = typeof m.cache_hit_rate === 'number' ? ` · 缓存命中 ${m.cache_hit_rate.toFixed(1)}%` : '';
       const effortEntries = m.efforts && typeof m.efforts === 'object' ? Object.entries(m.efforts) : [];
       const effortStr = effortEntries.length
-        ? ` · 思考强度: ${effortEntries.map(([k, v]) => `${k} ${v}次`).join(', ')}`
+        ? ` · 思考强度: ${effortEntries.map(([k, v]) => `${k} ${num(v)}次`).join(', ')}`
         : '';
-      const tip = `调用 ${m.calls} 次 · 输入 ${fmtTok(m.total_input_tokens)}${hitStr} · 输出 ${fmtTok(m.output_tokens)} (思考 ${fmtTok(m.thinking_tokens)})${effortStr}`;
+      const tip = `调用 ${calls} 次 · 输入 ${fmtTok(num(m.total_input_tokens))}${hitStr} · 输出 ${fmtTok(num(m.output_tokens))} (思考 ${fmtTok(num(m.thinking_tokens))})${effortStr}`;
       return `<div class="row" title="${esc(tip)}">`
         + `<span class="mark" style="background:${color}"></span>`
-        + `<span class="model-row-name">${esc(m.model)}<span class="cache-sub-inline"> · ${m.calls}次</span></span>`
-        + `<span class="tok num dim">${fmtTok(m.total_tokens)}</span>`
-        + `<span class="p num">${m.share_pct.toFixed(1)}%</span>`
+        + `<span class="model-row-name">${esc(m.model)}<span class="cache-sub-inline"> · ${calls}次</span></span>`
+        + `<span class="tok num dim">${fmtTok(num(m.total_tokens))}</span>`
+        + `<span class="p num">${sharePct.toFixed(1)}%</span>`
         + `</div>`;
     }).join('');
     return `<section id="models-section"><h2>Models <span class="hint">${models.length} 个模型 · 共 ${totalCalls} 次调用</span></h2>`
@@ -816,16 +919,17 @@
 
   function render(r) {
     const scrollY = window.scrollY;
-    const limit = r.limit_tokens;
+    const limit = num(r.limit_tokens);
+    const used = num(r.used_tokens);
     main.innerHTML = `
       <div class="top">
         <div class="model"><span class="live on" title="Live"></span>${esc(r.model)}</div>
         <button type="button" class="btn" id="copy" title="Copy the report as the CLI prints it">Copy as text</button>
       </div>
       <div class="usage">
-        <span class="big num">${fmtTok(r.used_tokens)}</span>
+        <span class="big num">${fmtTok(used)}</span>
         <span class="of">/ ${limit ? fmtTok(limit) : 'Unknown'} tokens</span>
-        ${limit ? `<span class="pct num">${r.used_pct.toFixed(1)}%</span>` : ''}
+        ${limit ? `<span class="pct num">${num(r.used_pct).toFixed(1)}%</span>` : ''}
       </div>
       ${categories(r)}
       ${modelsSectionHtml(r)}
@@ -852,45 +956,87 @@
   async function refreshExpandedRunningLogs() {
     if (!report || !Array.isArray(report.background_tasks)) return;
     const targets = report.background_tasks.filter(
-      (t) => t.status === 'running' && t.tool !== 'invoke_subagent' && expandedTaskIds.has(t.step_idx),
+      (t) => t.tool !== 'invoke_subagent'
+        && expandedTaskIds.has(t.step_idx)
+        && (t.status === 'running' || pendingFinalLogAt.has(t.step_idx)),
     );
     await Promise.all(targets.map((t) => fetchTaskLog(t.step_idx, false)));
   }
 
-  async function refresh() {
+  async function refresh(forceInput = false) {
     if (document.hidden) return;
+    const inputKey = `${conversationId}|${workspace}`;
+    // Do not cancel an active fetch with identical inputs; only supersede stale workspace/conversation switches
+    if (reportController && !forceInput && reportInFlightKey === inputKey) return;
+    const seq = ++reportSeq;
+    if (reportController) reportController.abort();
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    reportController = ctrl;
+    reportInFlightKey = inputKey;
     try {
-      const qs = new URLSearchParams({ conversationId, workspace });
-      const res = await doFetch(`/api/report?${qs}`);
-      const data = await res.json();
+      let data;
+      try {
+        const res = await apiPost('/api/report', { conversationId, workspace }, ctrl ? ctrl.signal : undefined);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        data = await res.json();
+      } finally {
+        if (seq === reportSeq) {
+          reportController = null;
+          reportInFlightKey = null;
+        }
+      }
+      if (seq !== reportSeq) return;
       if (data.error === 'no-conversation') return showMessage('Open a conversation to see its status bar.');
       if (data.error === 'no-database') return showMessage('This conversation has no saved data yet. Send a message first.');
       if (data.error) return showMessage(`Couldn't read this conversation: ${data.message || data.error}`);
+
+      const tasks = Array.isArray(data.background_tasks) ? data.background_tasks : [];
+      for (const t of tasks) {
+        if (prevTaskStatuses.get(t.step_idx) === 'running' && t.status !== 'running') {
+          pendingFinalLogAt.set(t.step_idx, seq);
+        } else if (t.status === 'running') {
+          pendingFinalLogAt.delete(t.step_idx);
+        }
+        prevTaskStatuses.set(t.step_idx, t.status);
+      }
+
       const json = JSON.stringify(data);
       if (json !== lastJson) {
         lastJson = json;
         report = data;
         render(data);
       }
+      setLiveOnline(true);
       await refreshExpandedRunningLogs();
-    } catch {
-      const dot = document.querySelector('.live');
-      if (dot) dot.classList.remove('on');
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;
+      if (seq !== reportSeq) return;
+      setLiveOnline(false);
+      if (!report) {
+        showMessage(`暂时无法读取上下文状态: ${err?.message || '请稍后重试'}`);
+      }
     }
   }
 
-  document.addEventListener('visibilitychange', refresh);
+  document.addEventListener('visibilitychange', () => refresh(false));
 
-  async function start() {
-    if (window.sidecar && window.sidecar.getWorkspaceUris) {
-      const uris = await window.sidecar.getWorkspaceUris();
-      workspace = uris[0] || '';
-      window.sidecar.onWorkspaceChange((next) => {
-        if ((next[0] || '') !== workspace) { workspace = next[0] || ''; lastJson = ''; refresh(); }
-      });
+  function start() {
+    refresh(true);
+    setInterval(() => refresh(false), POLL_MS);
+    if (window.sidecar) {
+      if (typeof window.sidecar.onWorkspaceChange === 'function') {
+        window.sidecar.onWorkspaceChange((next) => {
+          const nextUri = Array.isArray(next) ? (next[0] || '') : '';
+          if (nextUri !== workspace) { workspace = nextUri; lastJson = ''; refresh(true); }
+        });
+      }
+      if (typeof window.sidecar.getWorkspaceUris === 'function') {
+        Promise.resolve(window.sidecar.getWorkspaceUris()).then((uris) => {
+          const nextUri = Array.isArray(uris) ? (uris[0] || '') : '';
+          if (nextUri && nextUri !== workspace) { workspace = nextUri; lastJson = ''; refresh(true); }
+        }).catch(() => {});
+      }
     }
-    refresh();
-    setInterval(refresh, POLL_MS);
   }
   start();
 })();

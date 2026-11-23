@@ -6,14 +6,18 @@ The CLI reads the live trajectory from memory; this script reads the same
 protobufs from the conversation database (`steps` and `gen_metadata` tables).
 """
 
+from __future__ import annotations
+
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import re
 import sqlite3
 import sys
-from urllib.parse import unquote, urlparse
+import time
+from urllib.parse import quote, unquote, urlparse
 
 # --- protobuf ----------------------------------------------------------------
 
@@ -24,6 +28,8 @@ def read_varint(buf: bytes, pos: int) -> tuple[int, int]:
     while pos < len(buf):
         b = buf[pos]
         pos += 1
+        if shift == 63 and b > 1:
+            raise ValueError("Varint overflow")
         val |= (b & 0x7F) << shift
         if not (b & 0x80):
             return val, pos
@@ -41,15 +47,23 @@ class Msg:
             try:
                 tag, pos = read_varint(buf, pos)
                 fn, wt = tag >> 3, tag & 7
+                if fn <= 0:
+                    break
                 if wt == 0:
                     val, pos = read_varint(buf, pos)
                 elif wt == 2:
                     ln, pos = read_varint(buf, pos)
+                    if ln < 0 or pos + ln > n:
+                        break
                     val = buf[pos : pos + ln]
                     pos += ln
                 elif wt == 1:
+                    if pos + 8 > n:
+                        break
                     val, pos = buf[pos : pos + 8], pos + 8
                 elif wt == 5:
+                    if pos + 4 > n:
+                        break
                     val, pos = buf[pos : pos + 4], pos + 4
                 else:
                     break
@@ -74,10 +88,13 @@ class Msg:
     def str(self, fn: int) -> str:
         return self.bytes(fn).decode("utf-8", errors="replace")
 
-    def msg(self, fn: int) -> "Msg | None":
-        return Msg(self.bytes(fn)) if self.has(fn) else None
+    def msg(self, fn: int) -> Msg | None:
+        vals = [v for v in self.fields.get(fn, []) if isinstance(v, bytes)]
+        if not vals:
+            return None
+        return Msg(vals[0] if len(vals) == 1 else b"".join(vals))
 
-    def msgs(self, fn: int) -> list["Msg"]:
+    def msgs(self, fn: int) -> list[Msg]:
         return [Msg(v) for v in self.fields.get(fn, []) if isinstance(v, bytes)]
 
 
@@ -153,25 +170,43 @@ def go_div4(n: int) -> int:
     return int(n / 4)
 
 
+def sqlite_ro_uri(path: Path) -> str:
+    """Build a percent-encoded SQLite read-only URI safe for #, ?, %, spaces, drive letters, and UNC shares."""
+    abs_p = Path(os.path.abspath(os.fspath(path)))
+    posix_p = abs_p.as_posix()
+    if posix_p.startswith("//"):
+        return "file:////" + quote(posix_p.lstrip("/"), safe="/:") + "?mode=ro"
+    return abs_p.as_uri() + "?mode=ro"
+
+
 def uri_to_path(uri: str) -> str:
     """Convert a file:// URI to a local filesystem path."""
-    p = uri
-    if p.startswith("file:"):
-        parsed = urlparse(p)
-        p = unquote(parsed.path)
-        if len(p) > 2 and p[0] == "/" and p[2] == ":":
-            p = p[1:]
+    if not uri or not uri.startswith("file:"):
+        return uri
+    parsed = urlparse(uri)
+    netloc = unquote(parsed.netloc)
+    p = unquote(parsed.path)
+    if netloc and netloc.lower() != "localhost":
+        if os.name == "nt":
+            return "\\\\" + netloc + p.replace("/", "\\")
+        return f"//{netloc}{p}"
+    if len(p) > 2 and p[0] == "/" and p[2] == ":" and p[1].isalpha():
+        p = p[1:]
     return p
 
 
 def shorten_path(uri: str) -> str:
     p = uri_to_path(uri)
     home = str(Path.home())
-    p = p.replace("\\", "/")
-    home = home.replace("\\", "/")
-    if p.startswith(home):
-        return "~" + p[len(home) :]
-    return p
+    p_norm = p.replace("\\", "/")
+    home_norm = home.replace("\\", "/").rstrip("/")
+    if home_norm and p_norm == home_norm:
+        return "~"
+    if home_norm and p_norm.startswith(home_norm + "/"):
+        return "~" + p_norm[len(home_norm) :]
+    if os.name == "nt" and home_norm and p_norm.lower().startswith(home_norm.lower() + "/"):
+        return "~" + p_norm[len(home_norm) :]
+    return p_norm
 
 
 # --- stats (model.ContextModel.collectStats) ---------------------------------
@@ -235,6 +270,7 @@ class Step:
         self.task_details = Msg(task_details) if task_details else None
         self.error_details = error_details
         self.view_file_override: Msg | None = None
+        self.generic_pb: Msg | None = None
         if self.type == GENERIC_TYPE:
             self.rehydrate()
 
@@ -243,6 +279,7 @@ class Step:
         generic = self.pb.msg(STEP_GENERIC)
         if generic is None:
             return
+        self.generic_pb = generic
         original = packed_original_step(generic)
         if original is not None:
             self.pb = Msg(original)
@@ -252,15 +289,15 @@ class Step:
         tc = self.md.msg(4)
         if tc is None or tc.str(2) not in ("view_file", "read_file"):
             return
-        try:
-            args = json.loads(tc.str(3) or "{}")
-        except json.JSONDecodeError:
+        args = _parse_json_dict(tc.str(3))
+        if not args:
             return
         path = next((args[k] for k in ("AbsolutePath", "Path", "FilePath") if isinstance(args.get(k), str) and args[k]), "")
         if path:
+            path_bytes = path.encode("utf-8", errors="replace")
             self.type = 8  # VIEW_FILE
             self.view_file_override = Msg(
-                b"\x0a" + _varint(len(path.encode())) + path.encode() + (b"\x88\x01\x01" if is_skill_file(path) else b"")
+                b"\x0a" + _varint(len(path_bytes)) + path_bytes + (b"\x88\x01\x01" if is_skill_file(path) else b"")
             )
 
     def payload(self, fn: int) -> Msg | None:
@@ -338,7 +375,8 @@ def checkpoint_newer_than_generation(steps: list[Step], chat_start: Msg | None) 
     for s in steps[i + 1 :]:
         if s.payload(STEP_PLANNER_RESPONSE) is not None and s.status == STATUS_DONE:
             return -1, None
-    gen_ck = chat_start.int(2, signed32=True) if chat_start is not None else -1
+    has_gen_ck = chat_start is not None and chat_start.has(2)
+    gen_ck = chat_start.int(2, signed32=True) if has_gen_ck else -1
     ck_idx = steps[i].payload(STEP_CHECKPOINT).int(1)
     if gen_ck >= ck_idx:
         return -1, None
@@ -366,11 +404,15 @@ def chat_tokens_by_category(items: list[Msg]) -> tuple[bool, list[int]]:
     return True, out
 
 
-def detect_system_files(home: str, workspace: str | None, app_dir: str) -> list[tuple[str, int]]:
-    if not home:
+def detect_system_files(home: str, workspace: str | None, app_dir: str, gemini_dir: str | None = None) -> list[tuple[str, int]]:
+    if gemini_dir:
+        gemini = Path(gemini_dir).expanduser()
+        disp = "~/.gemini"
+    elif home:
+        gemini = Path(home) / ".gemini"
+        disp = "~/" + gemini.name
+    else:
         return []
-    gemini = Path(home) / ".gemini"
-    disp = "~/" + gemini.name
     found = []
     f = gemini / "GEMINI.md"
     if f.exists() and not f.is_dir():
@@ -423,7 +465,7 @@ def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> dict:
         elif cat == CAT_CHECKPOINT:
             st["checkpoint"] += tok
             ck = step.payload(STEP_CHECKPOINT)
-            if ck is not None:
+            if ck is not None and step.status == STATUS_DONE:
                 checkpoints.append({
                     "index": ck.int(1),
                     "start": ck.int(11),
@@ -507,16 +549,25 @@ def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> dict:
             if ok:
                 st["user"], st["agent"], st["tool"], st["system_messages"] = cats
             else:
-                est = st["user"] + st["agent"] + st["tool"]
+                cats_keys = ("user", "agent", "tool", "system_messages")
+                est = sum(st[k] for k in cats_keys)
                 if est == 0:
                     st["agent"] = chat_tok
                 else:
-                    f = chat_tok / est
-                    st["user"] = int(st["user"] * f)
-                    st["agent"] = int(st["agent"] * f)
-                    st["tool"] = int(st["tool"] * f)
+                    raw_scaled = [(k, st[k] * chat_tok / est) for k in cats_keys]
+                    floored = {k: int(v) for k, v in raw_scaled}
+                    rem = chat_tok - sum(floored.values())
+                    if rem > 0:
+                        for k, _ in sorted(raw_scaled, key=lambda kv: kv[1] - int(kv[1]), reverse=True):
+                            if rem <= 0:
+                                break
+                            if st[k] > 0:
+                                floored[k] += 1
+                                rem -= 1
+                    for k in cats_keys:
+                        st[k] = floored[k]
 
-    if chat_start is not None:
+    if chat_start is not None and chat_start.has(2):
         st["active_checkpoint"] = chat_start.int(2, signed32=True)
     if has_newer:
         st["agent"] += checkpoint_summary_tokens(newer_step)
@@ -581,7 +632,10 @@ def render_stats(st: dict, model: str) -> str:
         if always or tok:
             out.append(f"{icon} {name}: {fmt_tok(tok)} tokens ({pct(tok, limit):.1f}%)\n")
     free = limit - used if used < limit else 0
-    out.append(f"□ Free space: {fmt_tok(free)} ({pct(free, limit):.1f}%)\n")
+    if limit:
+        out.append(f"□ Free space: {fmt_tok(free)} ({pct(free, limit):.1f}%)\n")
+    else:
+        out.append("□ Free space: Unknown\n")
     if st["checkpoint"]:
         out.append(f"⊠ Checkpoint buffer: {fmt_tok(st['checkpoint'])} tokens (not counted in usage)\n")
     return "".join(out)
@@ -618,16 +672,16 @@ def render_grid(st: dict, width: int, rows: int, color: bool) -> list[str]:
 
 def checkpoint_view(st: dict) -> dict | None:
     cks = st["checkpoints"]
-    if not cks:
+    if not cks or st["active_checkpoint"] < 0:
         return None
     active, historical = None, 0
     for ck in cks:
-        if st["active_checkpoint"] >= 0 and ck["index"] == st["active_checkpoint"]:
+        if ck["index"] == st["active_checkpoint"]:
             active = ck
         else:
             historical += 1
     if active is None:
-        active, historical = cks[-1], len(cks) - 1
+        return None
     text = active["intent"]
     if len(text.encode()) > 70:
         text = text.encode()[:67].decode("utf-8", errors="ignore") + "..."
@@ -727,20 +781,59 @@ def _fallback_command_from_tool_call(tc: Msg | None) -> str:
     return ""
 
 
+def _clip_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _safe_str(val) -> str:
+    return val.strip() if isinstance(val, str) else ""
+
+
+def _safe_max_tokens(val) -> int:
+    if isinstance(val, bool):
+        return 0
+    if isinstance(val, int):
+        return val if 0 < val < 10_000_000_000 else 0
+    if isinstance(val, float):
+        if not math.isfinite(val) or val <= 0 or val >= 10_000_000_000:
+            return 0
+        return int(val)
+    return 0
+
+
+def _sqlite_connect_ro(db_path: Path) -> sqlite3.Connection:
+    uri = sqlite_ro_uri(db_path)
+    last_err: sqlite3.Error | None = None
+    for attempt in range(3):
+        try:
+            return sqlite3.connect(uri, uri=True, timeout=1.5)
+        except sqlite3.OperationalError as exc:
+            last_err = exc
+            msg = str(exc).lower()
+            if ("locked" in msg or "busy" in msg) and attempt < 2:
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            raise
+    assert last_err is not None
+    raise last_err
+
+
 def _subagent_db_status(db_path: Path | None, sub_conv_id: str) -> str:
     if db_path is None or not sub_conv_id or not re.fullmatch(r"[0-9a-fA-F-]+", sub_conv_id):
-        return "done"
+        return "unknown"
     sub_db = db_path.parent / f"{sub_conv_id}.db"
     if not sub_db.is_file():
-        return "done"
+        return "unknown"
     try:
-        conn = sqlite3.connect("file:" + sub_db.as_posix() + "?mode=ro", uri=True)
+        conn = _sqlite_connect_ro(sub_db)
         try:
             rows = conn.execute("SELECT status FROM steps ORDER BY idx DESC LIMIT 5").fetchall()
         finally:
             conn.close()
     except sqlite3.Error:
-        return "done"
+        return "unknown"
     if not rows:
         return "running"
     statuses = [r[0] for r in rows]
@@ -754,11 +847,26 @@ def _subagent_db_status(db_path: Path | None, sub_conv_id: str) -> str:
     return "done"
 
 
+def _extract_conversation_id(text: str) -> str:
+    if not text:
+        return ""
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        parsed = _parse_json_dict(stripped)
+        cid = parsed.get("conversationId")
+        if isinstance(cid, str) and re.fullmatch(r"[0-9a-fA-F-]+", cid):
+            return cid
+    m_cid = re.search(r'"conversationId"\s*:\s*"([0-9a-fA-F-]+)"', text)
+    return m_cid.group(1) if m_cid else ""
+
+
 def extract_background_tasks(steps: list[Step], db_path: Path | None = None) -> list[dict]:
     """Extract background tasks (commands, timers) and subagents from steps."""
     killed_subagents: dict[str, int] = {}
     latest_kill_all_idx = -1
     for step in steps:
+        if step.status != STATUS_DONE:
+            continue
         tc = step.md.msg(4)
         if tc is None or tc.str(2) != "manage_subagents":
             continue
@@ -767,9 +875,11 @@ def extract_background_tasks(steps: list[Step], db_path: Path | None = None) -> 
         if action == "kill_all":
             latest_kill_all_idx = max(latest_kill_all_idx, step.idx)
         elif action == "kill":
-            for cid in args.get("ConversationIds") or []:
-                if isinstance(cid, str) and cid:
-                    killed_subagents[cid] = max(killed_subagents.get(cid, -1), step.idx)
+            conv_ids = args.get("ConversationIds")
+            if isinstance(conv_ids, list):
+                for cid in conv_ids:
+                    if isinstance(cid, str) and cid:
+                        killed_subagents[cid] = max(killed_subagents.get(cid, -1), step.idx)
 
     tasks: list[dict] = []
     for step in steps:
@@ -778,7 +888,7 @@ def extract_background_tasks(steps: list[Step], db_path: Path | None = None) -> 
         tool_name = tc.str(2) if tc is not None else ""
 
         if td is not None and td.fields:
-            command = td.str(4) or _fallback_command_from_tool_call(tc)
+            command = _clip_text(td.str(4) or _fallback_command_from_tool_call(tc), 32768)
             log_uri = td.str(2)
             log_path = uri_to_path(log_uri) if log_uri else ""
             has_log = False
@@ -800,15 +910,16 @@ def extract_background_tasks(steps: list[Step], db_path: Path | None = None) -> 
             tasks.append({
                 "step_idx": step.idx,
                 "task_id": td.str(1),
-                "title": td.str(7),
+                "title": _clip_text(td.str(7), 512),
                 "command": command,
-                "output_preview": td.str(3),
+                "output_preview": _clip_text(td.str(3), 4096),
                 "status": status,
                 "status_code": status_code,
                 "is_daemon": bool(td.int(6)),
                 "tool": tool_name,
                 "started_at": started_at,
                 "has_log": has_log,
+                "log_path": log_path,
                 "log_mtime": log_mtime,
                 "log_size": log_size,
             })
@@ -816,13 +927,12 @@ def extract_background_tasks(steps: list[Step], db_path: Path | None = None) -> 
             args = _parse_json_dict(tc.str(3) if tc is not None else "")
             role = args.get("Role") if isinstance(args.get("Role"), str) else ""
             type_name = args.get("TypeName") if isinstance(args.get("TypeName"), str) else ""
-            prompt = args.get("Prompt") if isinstance(args.get("Prompt"), str) else ""
+            prompt = _clip_text(args.get("Prompt"), 32768) if isinstance(args.get("Prompt"), str) else ""
 
-            gen_step = step.pb.msg(STEP_GENERIC)
+            gen_step = step.pb.msg(STEP_GENERIC) or step.generic_pb
             res = gen_step.msg(2) if gen_step is not None else None
             res_text = res.str(1) if res is not None else ""
-            m_cid = re.search(r'"conversationId"\s*:\s*"([0-9a-fA-F-]+)"', res_text)
-            sub_conv_id = m_cid.group(1) if m_cid else ""
+            sub_conv_id = _extract_conversation_id(res_text)
 
             if step.status == 2:
                 status = "running"
@@ -861,28 +971,42 @@ def extract_background_tasks(steps: list[Step], db_path: Path | None = None) -> 
 # --- cache & output stats ----------------------------------------------------
 
 
+def _latest_usage_gen_idx(gens: list[Msg]) -> int:
+    last_idx = -1
+    for i, g in enumerate(gens):
+        chat = g.msg(1)
+        u = chat.msg(4) if chat is not None else None
+        if u is None:
+            continue
+        if u.int(2) + u.int(5) + u.int(3) > 0:
+            last_idx = i
+    return last_idx
+
+
 def collect_cache_stats(gens: list[Msg]) -> dict:
     """Compute latest-turn and session-cumulative prompt cache hit rates from gen_metadata."""
     generations = 0
     session_input = 0
     session_cache_read = 0
+    latest_idx = _latest_usage_gen_idx(gens)
     last_input = 0
     last_cache_read = 0
 
-    for g in gens:
+    for i, g in enumerate(gens):
         chat = g.msg(1)
         u = chat.msg(4) if chat is not None else None
         if u is None:
             continue
         inp = u.int(2)
         cache_read = u.int(5)
+        if i == latest_idx:
+            last_input = inp
+            last_cache_read = cache_read
         if inp + cache_read <= 0:
             continue
         generations += 1
         session_input += inp
         session_cache_read += cache_read
-        last_input = inp
-        last_cache_read = cache_read
 
     last_total_input = last_input + last_cache_read
     session_total_input = session_input + session_cache_read
@@ -904,24 +1028,26 @@ def collect_output_stats(gens: list[Msg]) -> dict:
     session_output = 0
     session_thinking = 0
     session_response = 0
+    latest_idx = _latest_usage_gen_idx(gens)
     last_output = 0
     last_thinking = 0
 
-    for g in gens:
+    for i, g in enumerate(gens):
         chat = g.msg(1)
         u = chat.msg(4) if chat is not None else None
         if u is None:
             continue
         out = u.int(3)
+        thinking = u.int(9)
+        if i == latest_idx:
+            last_output = out
+            last_thinking = thinking if out > 0 else 0
         if out <= 0:
             continue
-        thinking = u.int(9)
         resp = u.int(10)
         session_output += out
         session_thinking += thinking
         session_response += resp if resp > 0 else max(0, out - thinking)
-        last_output = out
-        last_thinking = thinking
 
     return {
         "session_output_tokens": session_output,
@@ -934,11 +1060,22 @@ def collect_output_stats(gens: list[Msg]) -> dict:
 
 
 def base_model_id(slug: str) -> str:
-    """Strip trailing effort suffix from a model slug: gemini-4-hydrogen-high -> gemini-4-hydrogen."""
-    parts = slug.split("-")
+    """Normalize model slug to base model family ID (strip effort & -tiered alias)."""
+    parts = [p for p in slug.strip().split("-") if p]
     if len(parts) > 1 and parts[-1].lower() in EFFORT_LEVELS:
-        return "-".join(parts[:-1])
-    return slug
+        parts.pop()
+    if len(parts) > 1 and parts[-1].lower() == "tiered":
+        parts.pop()
+    return "-".join(parts)
+
+
+def slug_effort_label(slug: str) -> str:
+    """Extract normalized effort label from a model slug when present."""
+    parts = [p for p in slug.strip().split("-") if p]
+    if len(parts) > 1 and parts[-1].lower() in EFFORT_LEVELS:
+        e = parts[-1].lower()
+        return "XHigh" if e == "xhigh" else e.capitalize()
+    return ""
 
 
 def split_model_effort(name: str) -> tuple[str, str]:
@@ -963,7 +1100,43 @@ def split_model_effort(name: str) -> tuple[str, str]:
 
 def collect_model_usage(gens: list[Msg], catalog: dict | None = None) -> list[dict]:
     """Aggregate per-model call counts and token usage across gen_metadata, grouped by base model."""
-    buckets: dict[str, dict] = {}
+    id_buckets: dict[str, dict] = {}
+    name_buckets: dict[str, dict] = {}
+
+    def _new_bucket(model_disp: str, mid_val: str) -> dict:
+        return {
+            "model": model_disp,
+            "model_id": mid_val,
+            "calls": 0,
+            "input_tokens": 0,
+            "cache_read_tokens": 0,
+            "output_tokens": 0,
+            "thinking_tokens": 0,
+            "efforts": {},
+            "_aliases": set(),
+            "_label_votes": {},
+        }
+
+    def _add_stats(entry: dict, inp: int, cache_read: int, out: int, thinking: int, effort: str):
+        entry["calls"] += 1
+        entry["input_tokens"] += inp
+        entry["cache_read_tokens"] += cache_read
+        entry["output_tokens"] += out
+        entry["thinking_tokens"] += thinking
+        if effort:
+            entry["efforts"][effort] = entry["efforts"].get(effort, 0) + 1
+
+    catalog_name_to_ids: dict[str, set[str]] = {}
+    for slug, cat_val in (catalog or {}).items():
+        if not isinstance(slug, str) or not isinstance(cat_val, dict):
+            continue
+        cat_disp = cat_val.get("displayName")
+        if isinstance(cat_disp, str) and cat_disp.strip():
+            cat_base = split_model_effort(cat_disp)[0].lower()
+            canon_slug = base_model_id(slug)
+            if cat_base and canon_slug:
+                catalog_name_to_ids.setdefault(cat_base, set()).add(canon_slug)
+
     for g in gens:
         chat = g.msg(1)
         u = chat.msg(4) if chat is not None else None
@@ -975,48 +1148,87 @@ def collect_model_usage(gens: list[Msg], catalog: dict | None = None) -> list[di
         thinking = u.int(9)
         if inp + cache_read + out <= 0:
             continue
+
         mid = model_id(g)
-        base_mid = base_model_id(mid) if mid else ""
-        catalog_display = ((catalog or {}).get(mid) or {}).get("displayName") or ""
+        resp_mid = chat.str(19) if chat is not None else ""
+        canon_id = base_model_id(mid) if mid else (base_model_id(resp_mid) if resp_mid and "-" in resp_mid else "")
+
+        raw_cat = (catalog or {}).get(mid)
+        catalog_display = _safe_str(raw_cat.get("displayName")) if isinstance(raw_cat, dict) else ""
         chat_display = chat.str(21) if chat is not None else ""
         raw_display = catalog_display or model_name(g)
-        display, effort = split_model_effort(raw_display)
-        base_catalog, _ = split_model_effort(catalog_display) if catalog_display else ("", "")
-        base_chat, _ = split_model_effort(chat_display) if chat_display else ("", "")
-        bucket_key = display.lower()
-        entry = buckets.get(bucket_key)
-        if entry is None:
-            entry = {
-                "model": display,
-                "model_id": base_mid,
-                "calls": 0,
-                "input_tokens": 0,
-                "cache_read_tokens": 0,
-                "output_tokens": 0,
-                "thinking_tokens": 0,
-                "efforts": {},
-            }
-            buckets[bucket_key] = entry
+        display, disp_effort = split_model_effort(raw_display)
+        slug_effort = (
+            slug_effort_label(mid)
+            if mid
+            else (slug_effort_label(resp_mid) if resp_mid and "-" in resp_mid else "")
+        )
+        effort = slug_effort or disp_effort
+
+        base_catalog = split_model_effort(catalog_display)[0] if catalog_display else ""
+        base_chat = split_model_effort(chat_display)[0] if chat_display else ""
+        id_default = split_model_effort(model_label(canon_id))[0] if canon_id else ""
+
+        if canon_id:
+            entry = id_buckets.get(canon_id)
+            chosen_label = base_catalog or base_chat or id_default or display
+            if entry is None:
+                entry = _new_bucket(chosen_label, canon_id)
+                id_buckets[canon_id] = entry
+            for alias in (display, base_catalog, base_chat, id_default):
+                if alias:
+                    entry["_aliases"].add(alias.lower())
+            vote_label = base_catalog or base_chat or id_default
+            if vote_label:
+                entry["_label_votes"][vote_label] = entry["_label_votes"].get(vote_label, 0) + 1
+            _add_stats(entry, inp, cache_read, out, thinking, effort)
         else:
-            if base_catalog or (base_chat and entry["model"].lower() == base_chat.lower()):
-                entry["model"] = base_catalog or base_chat
-            if base_mid and not entry["model_id"]:
-                entry["model_id"] = base_mid
-        entry["calls"] += 1
-        entry["input_tokens"] += inp
-        entry["cache_read_tokens"] += cache_read
-        entry["output_tokens"] += out
-        entry["thinking_tokens"] += thinking
-        if effort:
-            entry["efforts"][effort] = entry["efforts"].get(effort, 0) + 1
+            key = display.lower()
+            entry = name_buckets.get(key)
+            if entry is None:
+                entry = _new_bucket(display, "")
+                name_buckets[key] = entry
+            _add_stats(entry, inp, cache_read, out, thinking, effort)
+
+    # Merge historical no-ID buckets only when unambiguous across BOTH observed session IDs and the catalog
+    unmatched_names: list[dict] = []
+    for name_key, n_entry in name_buckets.items():
+        matches = [b for b in id_buckets.values() if name_key in b["_aliases"]]
+        cat_ids = catalog_name_to_ids.get(name_key)
+        if len(matches) == 1 and (not cat_ids or cat_ids == {matches[0]["model_id"]}):
+            target = matches[0]
+            target["calls"] += n_entry["calls"]
+            target["input_tokens"] += n_entry["input_tokens"]
+            target["cache_read_tokens"] += n_entry["cache_read_tokens"]
+            target["output_tokens"] += n_entry["output_tokens"]
+            target["thinking_tokens"] += n_entry["thinking_tokens"]
+            for eff, cnt in n_entry["efforts"].items():
+                target["efforts"][eff] = target["efforts"].get(eff, 0) + cnt
+            lbl = n_entry["model"]
+            target["_label_votes"][lbl] = target["_label_votes"].get(lbl, 0) + n_entry["calls"]
+        else:
+            unmatched_names.append(n_entry)
+
+    all_buckets: list[dict] = []
+    for b in id_buckets.values():
+        if b["_label_votes"]:
+            b["model"] = max(b["_label_votes"].items(), key=lambda kv: kv[1])[0]
+        all_buckets.append(b)
+    all_buckets.extend(unmatched_names)
 
     results: list[dict] = []
-    for entry in buckets.values():
+    for entry in all_buckets:
         total_in = entry["input_tokens"] + entry["cache_read_tokens"]
         total = total_in + entry["output_tokens"]
         efforts = dict(sorted(entry["efforts"].items(), key=lambda kv: kv[1], reverse=True))
         results.append({
-            **entry,
+            "model": entry["model"],
+            "model_id": entry["model_id"],
+            "calls": entry["calls"],
+            "input_tokens": entry["input_tokens"],
+            "cache_read_tokens": entry["cache_read_tokens"],
+            "output_tokens": entry["output_tokens"],
+            "thinking_tokens": entry["thinking_tokens"],
             "efforts": efforts,
             "total_input_tokens": total_in,
             "total_tokens": total,
@@ -1035,19 +1247,61 @@ def collect_model_usage(gens: list[Msg], catalog: dict | None = None) -> list[di
 
 
 def load_db(db_path: Path, catalog: dict | None = None) -> tuple[list[Step], Msg | None, dict, dict, list[dict]]:
-    uri = "file:" + db_path.as_posix() + "?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
-    try:
-        rows = conn.execute(
-            "SELECT idx, step_type, status, metadata, step_payload, task_details, error_details FROM steps ORDER BY idx"
-        ).fetchall()
-        steps = [
-            Step(pos, r[4] or b"", r[1], r[2], r[3], idx=r[0], task_details=r[5], error_details=r[6])
-            for pos, r in enumerate(rows)
-        ]
-        gen_rows = conn.execute("SELECT data FROM gen_metadata ORDER BY idx").fetchall()
-    finally:
-        conn.close()
+    last_err: sqlite3.Error | None = None
+    rows: list[tuple] = []
+    gen_rows: list[tuple] = []
+    col_names: set[str] = set()
+    for attempt in range(3):
+        conn = _sqlite_connect_ro(db_path)
+        try:
+            conn.execute("BEGIN")
+            step_cols = [r[1] for r in conn.execute("PRAGMA table_info(steps)").fetchall()]
+            if not step_cols:
+                raise RuntimeError("Unsupported conversation database schema: missing steps table")
+            col_names = set(step_cols)
+            has_task_details = "task_details" in col_names
+            has_error_details = "error_details" in col_names
+            select_cols = [
+                "idx" if "idx" in col_names else "rowid",
+                "step_type" if "step_type" in col_names else "0",
+                "status" if "status" in col_names else "0",
+                "metadata" if "metadata" in col_names else "NULL",
+                "step_payload" if "step_payload" in col_names else "NULL",
+                "task_details" if has_task_details else "NULL",
+                "error_details" if has_error_details else "NULL",
+            ]
+            rows = conn.execute(f"SELECT {', '.join(select_cols)} FROM steps ORDER BY 1").fetchall()
+            has_gen = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='gen_metadata'"
+            ).fetchone()
+            if has_gen:
+                gen_cols = {r[1] for r in conn.execute("PRAGMA table_info(gen_metadata)").fetchall()}
+                if "data" in gen_cols:
+                    order_col = "idx" if "idx" in gen_cols else "rowid"
+                    gen_rows = conn.execute(f"SELECT data FROM gen_metadata ORDER BY {order_col}").fetchall()
+                else:
+                    gen_rows = []
+            else:
+                gen_rows = []
+            conn.rollback()
+            last_err = None
+            break
+        except sqlite3.OperationalError as exc:
+            last_err = exc
+            msg = str(exc).lower()
+            if ("locked" in msg or "busy" in msg) and attempt < 2:
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            raise
+        finally:
+            conn.close()
+    if last_err is not None:
+        raise last_err
+
+    steps = [
+        Step(pos, r[4] or b"", r[1], r[2], r[3], idx=r[0], task_details=r[5], error_details=r[6])
+        for pos, r in enumerate(rows)
+    ]
     gens = [Msg(r[0]) for r in gen_rows]
     return (
         steps,
@@ -1141,6 +1395,7 @@ def main():
     parser.add_argument("--workspace", help="Active workspace path", default=None)
     parser.add_argument("--limit", type=int, default=0, help="Context window token limit override")
     parser.add_argument("--app-dir", default="antigravity", help="App data folder under ~/.gemini (default: antigravity)")
+    parser.add_argument("--gemini-dir", default=None, help="Explicit .gemini config root directory override")
     parser.add_argument("--width", type=int, default=100, help="Terminal width used for the grid layout")
     parser.add_argument("--color", action="store_true", help="Color the grid segments with ANSI escapes")
     parser.add_argument("--json", action="store_true", help="Output JSON data")
@@ -1151,8 +1406,11 @@ def main():
     if args.db:
         db_path = Path(args.db).expanduser()
         conv_id = db_path.stem
+        effective_gemini_dir = args.gemini_dir
     else:
-        conv_dir = Path.home() / ".gemini" / "antigravity" / "conversations"
+        effective_gemini_dir = args.gemini_dir or os.environ.get("ANTIGRAVITY_GEMINI_DIR")
+        gemini_root = Path(effective_gemini_dir).expanduser() if effective_gemini_dir else (Path.home() / ".gemini")
+        conv_dir = gemini_root / args.app_dir / "conversations"
         conv_id = args.conversation_id
         if not conv_id:
             dbs = sorted(conv_dir.glob("*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -1165,14 +1423,21 @@ def main():
 
     catalog = {}
     if args.model_catalog:
-        with open(args.model_catalog, encoding="utf-8") as fh:
-            catalog = json.load(fh)
+        try:
+            with open(args.model_catalog, encoding="utf-8") as fh:
+                loaded_catalog = json.load(fh)
+            if isinstance(loaded_catalog, dict):
+                catalog = loaded_catalog
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[status-bar] ignoring invalid model catalog {args.model_catalog}: {exc}", file=sys.stderr)
     steps, gen, cache_stats, output_stats, model_usage = load_db(db_path, catalog=catalog)
-    catalog_entry = catalog.get(model_id(gen)) or {}
-    limit = args.limit if args.limit > 0 else int(catalog_entry.get("maxTokens") or 0) or context_limit(gen)
+    raw_cat_entry = catalog.get(model_id(gen))
+    catalog_entry = raw_cat_entry if isinstance(raw_cat_entry, dict) else {}
+    cat_max = _safe_max_tokens(catalog_entry.get("maxTokens"))
+    limit = args.limit if args.limit > 0 else cat_max or context_limit(gen)
     st = collect_stats(steps, gen, limit)
-    model = catalog_entry.get("displayName") or model_name(gen)
-    system_files = detect_system_files(os.path.expanduser("~"), args.workspace, args.app_dir)
+    model = _safe_str(catalog_entry.get("displayName")) or model_name(gen)
+    system_files = detect_system_files(os.path.expanduser("~"), args.workspace, args.app_dir, gemini_dir=effective_gemini_dir)
 
     if args.json:
         print(json.dumps({

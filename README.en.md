@@ -11,14 +11,14 @@ A live side-panel status bar plugin for the **Antigravity 2.0 desktop app** — 
 - **Claude Code Style Segmented Context Bar**: Color-coded proportional bar (`System / User / Agent / Tools / Custom / SysMsg`) with a **request-budget / compaction threshold tick mark**; hover any segment to inspect token counts and highlight matching breakdown rows.
 - **Unified Token Usage (Cache Hit & Output Stats)**: Shows per-category token usage alongside compact inline rows for `Cache hit` (latest turn + session cumulative hit rate) and `Output` (total output + thinking token share).
 - **Per-Model Usage Breakdown (`Models`)**: Built for Orchestrator / multi-model sessions — summarizes call counts, cumulative token share, and cache hit rate per model (automatically hidden in single-model conversations).
-- **Background Tasks & Subagents Monitor**: Captures active and recent `run_command` jobs, `Daemon` processes, `Timer` schedules, and `Subagent` invocations; click any item to inspect the full command/prompt, status, and live log tail.
+- **Background Tasks & Subagents Monitor**: Captures active and recent `run_command` jobs, `Daemon` processes, `Timer` schedules, and `Subagent` invocations; click any item to inspect the command/prompt (clipped above 32K chars), status, and live log tail (last 32 KB).
 - **Zero Token Cost & Native Theming**: Polls locally every 3 seconds via Antigravity Sidecar, syncs live context limits from the app's model catalog, and adapts automatically to light/dark themes.
 
 ## Quick Install
 
 ### Option 1: Copy & Paste Prompt to Your Agent (Recommended)
 
-Send this prompt directly to Antigravity (requires `git` and `python3` installed):
+Send this prompt directly to Antigravity (requires `git` and `Python 3.9+` installed):
 
 ```text
 Please install the "Antigravity 状态栏" (antigravity-status-bar) plugin for me:

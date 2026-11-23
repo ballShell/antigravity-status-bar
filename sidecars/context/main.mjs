@@ -1,18 +1,31 @@
 // Sidecar backend for the Context Usage panel.
 //
-// Serves the panel and a /api/report endpoint that runs context_report.py (the
-// same parser as the /context skill) on the open conversation's database. The
-// model's context window and display name come from the app's live model
-// catalog (GetAvailableModels), like the agy CLI.
+// Serves the panel and /api/report + /api/task-log endpoints backed by
+// context_report.py and the live Antigravity model catalog.
 
-import { execFile } from 'node:child_process';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Response, SidecarApp } from 'sidecar_sdk';
+import {
+  MAX_CATALOG_BYTES,
+  UUID,
+  collectDependencyStamps,
+  dependencyStampsMatch,
+  execAsync,
+  fileStamp,
+  isLoopbackHostname,
+  normalizeCatalogResponse,
+  probePython,
+  readTaskLogSafe,
+  snapshotDependencyStamps,
+  stampsUnchanged,
+  workspacePath,
+  writeJsonAtomic,
+} from './sidecar_utils.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = join(HERE, 'context_report.py');
@@ -21,46 +34,34 @@ const CONVERSATIONS = join(GEMINI_DIR, 'antigravity', 'conversations');
 const DATA_DIR = process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR || join(HERE, '.data');
 const CATALOG_PATH = join(DATA_DIR, 'model-catalog.json');
 const CATALOG_TTL_MS = 10 * 60 * 1000;
-const MAX_LOG_BYTES = 32 * 1024;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CATALOG_RETRY_MS = 30 * 1000;
+const MAX_CACHE_ENTRIES = 20;
+const MAX_CACHE_AGE_MS = 60 * 1000;
 
 const app = new SidecarApp();
 
 // --- python -------------------------------------------------------------------
 
 const PYTHON_CANDIDATES = process.platform === 'win32'
-  ? [['python', []], ['py', ['-3']], ['python3', []]]
+  ? [['py', ['-3']], ['python', []], ['python3', []]]
   : [['python3', []], ['python', []]];
-let python = null;
+let pythonPromise = null;
 
-function run(cmd, args, timeout = 20000) {
-  return new Promise((resolve, reject) => {
-    execFile(cmd, args, {
-      timeout,
-      maxBuffer: 16 * 1024 * 1024,
-      env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
-      windowsHide: true,
-    }, (err, stdout, stderr) => (err ? reject(new Error((stderr || err.message).trim())) : resolve(stdout)));
-  });
-}
-
-async function findPython() {
-  if (python) return python;
-  for (const [cmd, pre] of PYTHON_CANDIDATES) {
-    try {
-      const out = await run(cmd, [...pre, '--version'], 5000);
-      if (/^Python 3\./.test(out.trim())) {
-        python = { cmd, pre };
-        return python;
-      }
-    } catch { /* try the next candidate */ }
+function findPython() {
+  if (!pythonPromise) {
+    pythonPromise = probePython(PYTHON_CANDIDATES, execAsync).catch((err) => {
+      pythonPromise = null;
+      throw err;
+    });
   }
-  throw new Error('Python 3 not found. Install it from python.org and restart Antigravity.');
+  return pythonPromise;
 }
 
 // --- live model catalog -------------------------------------------------------
 
 let catalogFetchedAt = 0;
+let catalogRetryAfter = 0;
+let catalogRefreshPromise = null;
 
 function lsRequest(method, body) {
   const addr = (process.env.ANTIGRAVITY_LS_ADDRESS || '').trim();
@@ -69,31 +70,50 @@ function lsRequest(method, body) {
   const base = new URL(addr.startsWith('http') ? addr : `http://${addr}`);
   const data = JSON.stringify(body);
   const transport = base.protocol === 'https:' ? https : http;
+  const loopback = isLoopbackHostname(base.hostname);
+
   return new Promise((resolve, reject) => {
-    const req = transport.request({
-      hostname: base.hostname,
-      port: base.port,
-      path: `/exa.language_server_pb.LanguageServerService/${method}`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Connect-Protocol-Version': '1',
-        'x-codeium-csrf-token': csrf,
-        'Content-Length': Buffer.byteLength(data),
+    const req = transport.request(
+      {
+        hostname: base.hostname,
+        port: base.port,
+        path: `/exa.language_server_pb.LanguageServerService/${method}`,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Connect-Protocol-Version': '1',
+          'x-codeium-csrf-token': csrf,
+          'Content-Length': Buffer.byteLength(data),
+        },
+        timeout: 5000,
+        rejectUnauthorized: !loopback,
       },
-      timeout: 5000,
-      rejectUnauthorized: false,
-    }, (res) => {
-      let text = '';
-      res.on('data', (chunk) => { text += chunk; });
-      res.on('end', () => {
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          reject(new Error(`${method}: HTTP ${res.statusCode}`));
-          return;
-        }
-        try { resolve(JSON.parse(text)); } catch (e) { reject(e); }
-      });
-    });
+      (res) => {
+        const chunks = [];
+        let totalBytes = 0;
+        res.on('data', (chunk) => {
+          totalBytes += chunk.length;
+          if (totalBytes > MAX_CATALOG_BYTES) {
+            req.destroy(new Error(`${method}: response exceeds ${MAX_CATALOG_BYTES} bytes`));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on('error', reject);
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            reject(new Error(`${method}: HTTP ${res.statusCode}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(text));
+          } catch (e) {
+            reject(e);
+          }
+        });
+      },
+    );
     req.on('timeout', () => req.destroy(new Error(`${method}: timeout`)));
     req.on('error', reject);
     req.end(data);
@@ -101,42 +121,46 @@ function lsRequest(method, body) {
 }
 
 async function refreshCatalog() {
-  if (Date.now() - catalogFetchedAt < CATALOG_TTL_MS && existsSync(CATALOG_PATH)) return;
-  catalogFetchedAt = Date.now();
-  try {
-    const resp = await lsRequest('GetAvailableModels', { metadata: { ideName: 'antigravity', extensionName: 'antigravity' } });
-    const models = resp?.response?.models || resp?.models || {};
-    const catalog = {};
-    for (const [id, m] of Object.entries(models)) {
-      const maxTokens = Number(m?.maxTokens) || 0;
-      if (maxTokens > 0) catalog[id] = { maxTokens, displayName: m.displayName || '' };
+  const now = Date.now();
+  if (now < catalogRetryAfter) return;
+  if (now - catalogFetchedAt < CATALOG_TTL_MS && existsSync(CATALOG_PATH)) return;
+  if (catalogRefreshPromise) return catalogRefreshPromise;
+
+  catalogRefreshPromise = (async () => {
+    try {
+      const resp = await lsRequest('GetAvailableModels', {
+        metadata: { ideName: 'antigravity', extensionName: 'antigravity' },
+      });
+      const catalog = normalizeCatalogResponse(resp);
+      if (Object.keys(catalog).length) {
+        writeJsonAtomic(CATALOG_PATH, catalog);
+        catalogFetchedAt = Date.now();
+        catalogRetryAfter = 0;
+      } else {
+        catalogRetryAfter = Date.now() + CATALOG_RETRY_MS;
+      }
+    } catch (err) {
+      catalogRetryAfter = Date.now() + CATALOG_RETRY_MS;
+      console.error('[status-bar] model catalog unavailable, using built-in/cached limits:', err.message);
+    } finally {
+      catalogRefreshPromise = null;
     }
-    if (Object.keys(catalog).length) {
-      mkdirSync(DATA_DIR, { recursive: true });
-      writeFileSync(CATALOG_PATH, JSON.stringify(catalog));
-    }
-  } catch (err) {
-    console.error('[status-bar] model catalog unavailable, using built-in limits:', err.message);
-  }
+  })();
+
+  return catalogRefreshPromise;
 }
 
 // --- report -------------------------------------------------------------------
 
-const cache = new Map(); // conversationId -> { key, report }
+const cache = new Map(); // conversationId -> { key, depStamps, createdAt, report }
+const inFlight = new Map(); // `${conversationId}|${key}` -> Promise<object>
 
-function workspacePath(uri) {
-  if (!uri || !uri.startsWith('file:')) return '';
-  let p = decodeURIComponent(uri.replace(/^file:\/\//, ''));
-  if (/^\/[A-Za-z]:/.test(p)) p = p.slice(1);
-  return p;
-}
-
-function fileStamp(path) {
-  try {
-    const s = statSync(path);
-    return `${s.mtimeMs}:${s.size}`;
-  } catch {
-    return '-';
+function setBoundedCache(conversationId, entry) {
+  if (cache.has(conversationId)) cache.delete(conversationId);
+  cache.set(conversationId, entry);
+  while (cache.size > MAX_CACHE_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
+    cache.delete(oldestKey);
   }
 }
 
@@ -150,74 +174,60 @@ async function report(conversationId, workspaceUri) {
   }
   await refreshCatalog();
   const workspace = workspacePath(workspaceUri);
-  const key = [fileStamp(db), fileStamp(`${db}-wal`), workspace, fileStamp(CATALOG_PATH)].join('|');
+  const tasksDir = join(GEMINI_DIR, 'antigravity', 'brain', conversationId, '.system_generated', 'tasks');
+  const dbStamp = fileStamp(db);
+  const walStamp = fileStamp(`${db}-wal`);
+  const scriptStamp = fileStamp(SCRIPT);
+  const catalogStamp = fileStamp(CATALOG_PATH);
+  const tasksStamp = fileStamp(tasksDir);
+  const key = JSON.stringify([dbStamp, walStamp, scriptStamp, workspace, catalogStamp, tasksStamp]);
+
   const cached = cache.get(conversationId);
-  if (cached && cached.key === key) return cached.report;
-
-  const { cmd, pre } = await findPython();
-  const args = [...pre, SCRIPT, '--db', db, '--json'];
-  if (existsSync(CATALOG_PATH)) args.push('--model-catalog', CATALOG_PATH);
-  if (workspace) args.push('--workspace', workspace);
-  const out = await run(cmd, args);
-  const result = { ...JSON.parse(out), updatedAt: new Date().toISOString() };
-  cache.set(conversationId, { key, report: result });
-  return result;
-}
-
-// --- task logs ----------------------------------------------------------------
-
-function readTaskLog(conversationId, stepIdx) {
-  const idxStr = String(stepIdx ?? '');
-  if (!UUID.test(conversationId || '') || !/^\d+$/.test(idxStr)) {
-    return { error: 'invalid-params' };
+  if (
+    cached
+    && cached.key === key
+    && Date.now() - cached.createdAt < MAX_CACHE_AGE_MS
+    && dependencyStampsMatch(cached.depStamps)
+  ) {
+    return cached.report;
   }
-  const logPath = join(
-    GEMINI_DIR,
-    'antigravity',
-    'brain',
-    conversationId,
-    '.system_generated',
-    'tasks',
-    `task-${idxStr}.log`,
-  );
-  if (!existsSync(logPath)) {
-    return { exists: false, content: '', size: 0, mtimeMs: 0, truncated: false };
+
+  const flightKey = `${conversationId}|${key}`;
+  if (inFlight.has(flightKey)) {
+    return inFlight.get(flightKey);
   }
-  const stat = statSync(logPath);
-  if (!stat.isFile()) {
-    return { exists: false, content: '', size: 0, mtimeMs: 0, truncated: false };
-  }
-  const truncated = stat.size > MAX_LOG_BYTES;
-  const toRead = Math.min(stat.size, MAX_LOG_BYTES);
-  const offset = stat.size - toRead;
-  let content = '';
-  if (toRead > 0) {
-    const buf = Buffer.allocUnsafe(toRead);
-    const fd = openSync(logPath, 'r');
-    try {
-      let readTotal = 0;
-      while (readTotal < toRead) {
-        const n = readSync(fd, buf, readTotal, toRead - readTotal, offset + readTotal);
-        if (n <= 0) break;
-        readTotal += n;
-      }
-      content = buf.subarray(0, readTotal).toString('utf8');
-      if (truncated) {
-        const nl = content.indexOf('\n');
-        if (nl !== -1 && nl < 256) content = content.slice(nl + 1);
-      }
-    } finally {
-      closeSync(fd);
+
+  const job = (async () => {
+    const runStartedMs = Date.now();
+    const baseStamps = cached
+      ? snapshotDependencyStamps(cached.depStamps)
+      : collectDependencyStamps(null, CONVERSATIONS, tasksDir, GEMINI_DIR, workspace);
+    const { cmd, pre } = await findPython();
+    const args = [...pre, SCRIPT, '--db', db, '--json'];
+    if (process.env.ANTIGRAVITY_GEMINI_DIR) args.push('--gemini-dir', GEMINI_DIR);
+    if (existsSync(CATALOG_PATH)) args.push('--model-catalog', CATALOG_PATH);
+    if (workspace) args.push('--workspace', workspace);
+    const out = await execAsync(cmd, args);
+    const parsed = JSON.parse(out);
+    const result = { ...parsed, updatedAt: new Date().toISOString() };
+    const depStamps = collectDependencyStamps(parsed, CONVERSATIONS, tasksDir, GEMINI_DIR, workspace);
+    const inputsStillFresh = fileStamp(db) === dbStamp
+      && fileStamp(`${db}-wal`) === walStamp
+      && fileStamp(CATALOG_PATH) === catalogStamp
+      && stampsUnchanged(baseStamps, depStamps, runStartedMs);
+    if (inputsStillFresh) {
+      setBoundedCache(conversationId, { key, depStamps, createdAt: Date.now(), report: result });
     }
-  }
-  return {
-    exists: true,
-    content,
-    size: stat.size,
-    mtimeMs: stat.mtimeMs,
-    truncated,
-  };
+    return result;
+  })().finally(() => {
+    inFlight.delete(flightKey);
+  });
+
+  inFlight.set(flightKey, job);
+  return job;
 }
+
+// --- routes -------------------------------------------------------------------
 
 app.page('/', () => new Response(readFileSync(join(HERE, 'index.html'), 'utf8'), { contentType: 'text/html' }));
 
@@ -227,15 +237,15 @@ app.api('/api/report', async (data) => {
   } catch (err) {
     return { error: 'failed', message: err.message };
   }
-}, 'GET');
+}, 'POST');
 
 app.api('/api/task-log', async (data) => {
   try {
-    return readTaskLog(data.conversationId, data.stepIdx);
+    return readTaskLogSafe(GEMINI_DIR, data.conversationId, data.stepIdx);
   } catch (err) {
     return { error: 'failed', message: err.message };
   }
-}, 'GET');
+}, 'POST');
 
 app.run();
 refreshCatalog();

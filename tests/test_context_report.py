@@ -3,6 +3,8 @@
 Run with: python -m unittest discover tests
 """
 
+from __future__ import annotations
+
 import importlib.util
 import json
 import os
@@ -119,9 +121,11 @@ class ReportTest(unittest.TestCase):
         self.home = Path(self.tmp.name)
         self.db_path = self.home / "conv.db"
         self.db = ConversationDB(self.db_path)
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(lambda: getattr(self, "db", None) and self.db.close())
 
     def tearDown(self):
-        self.tmp.cleanup()
+        self.db.close()
 
     def run_report(self, *args: str) -> str:
         self.db.close()
@@ -628,6 +632,172 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(by_name["Orchestrator (Carbon)"]["efforts"], {})
         self.assertEqual(by_name["Orchestrator (Neon)"]["efforts"], {})
 
+    def test_catalog_partial_rename_and_shared_display_name(self):
+        self.basic_steps()
+        catalog = self.home / "catalog_edge.json"
+        catalog.write_text(json.dumps({
+            # Only High variant has a custom rename without effort label; Medium uses default name
+            "gemini-4-hydrogen-high": {"maxTokens": 1_048_576, "displayName": "Hydrogen Custom"},
+            "gemini-4-hydrogen-medium": {"maxTokens": 1_048_576, "displayName": "Gemini 4 Hydrogen (Medium)"},
+            # Two distinct model IDs sharing an identical catalog displayName must NOT merge
+            "gemini-2.5-flash": {"maxTokens": 1_048_576, "displayName": "Gemini 3.5 Flash Lite"},
+            "gemini-3.5-flash-lite": {"maxTokens": 1_048_576, "displayName": "Gemini 3.5 Flash Lite"},
+        }))
+        self.db.generation(
+            [group(7, 1000, ("0: USER_INPUT", 1000))],
+            usage=usage(input_tokens=100, output=50),
+            model="gemini-4-hydrogen-high",
+            display_name="",
+        )
+        self.db.generation(
+            [group(7, 1000, ("0: USER_INPUT", 1000))],
+            usage=usage(input_tokens=100, output=50),
+            model="gemini-4-hydrogen-medium",
+            display_name="",
+        )
+        self.db.generation(
+            [group(7, 1000, ("0: USER_INPUT", 1000))],
+            usage=usage(input_tokens=100, output=50),
+            model="gemini-4-hydrogen-medium",
+            display_name="",
+        )
+        self.db.generation(
+            [group(7, 1000, ("0: USER_INPUT", 1000))],
+            usage=usage(input_tokens=80, output=20),
+            model="gemini-2.5-flash",
+            display_name="",
+        )
+        self.db.generation(
+            [group(7, 1000, ("0: USER_INPUT", 1000))],
+            usage=usage(input_tokens=70, output=20),
+            model="gemini-3.5-flash-lite",
+            display_name="",
+        )
+        mu = self.report("--model-catalog", str(catalog))["model_usage"]
+        by_id = {m["model_id"]: m for m in mu}
+        self.assertEqual(set(by_id.keys()), {"gemini-4-hydrogen", "gemini-2.5-flash", "gemini-3.5-flash-lite"})
+        self.assertEqual(by_id["gemini-4-hydrogen"]["model"], "Gemini 4 Hydrogen")
+        self.assertEqual(by_id["gemini-4-hydrogen"]["efforts"], {"Medium": 2, "High": 1})
+        self.assertEqual(by_id["gemini-2.5-flash"]["calls"], 1)
+        self.assertEqual(by_id["gemini-3.5-flash-lite"]["calls"], 1)
+
+    def test_json_type_guards_and_missing_subagent_db(self):
+        # Null and array JSON in view_file rehydrate + non-list ConversationIds + pending kill must not crash or cancel
+        for bad_args in ("null", "[1, 2]", '"string"'):
+            self.db.step(GENERIC, metadata=f(4, m(f(2, "view_file"), f(3, bad_args))), payload_field=140, payload=f(2, b""))
+
+        missing_sub_id = "44444444-4444-4444-4444-444444444444"
+        md_sub = m(f(1, f(1, 1795262000)), f(4, m(f(2, "invoke_subagent"), f(3, json.dumps({"Role": "Explorer", "TypeName": "research", "Prompt": "Scan"})))))
+        res_sub = f(1, f'{{"conversationId": "{missing_sub_id}"}}')
+        self.db.step(GENERIC, metadata=md_sub, payload_field=140, payload=f(2, res_sub), status=3)
+
+        # Failed manage_subagents kill (status=4) and scalar ConversationIds
+        self.db.step(GENERIC, metadata=f(4, m(f(2, "manage_subagents"), f(3, json.dumps({"Action": "kill", "ConversationIds": missing_sub_id})))), status=4)
+
+        r = self.report()
+        self.assertEqual(len(r["background_tasks"]), 1)
+        self.assertEqual(r["background_tasks"][0]["status"], "unknown")
+
+    def test_inactive_checkpoint_not_promoted_and_reserved_path_wal(self):
+        # Reserved URI chars (#, %, space) valid on both POSIX and Windows + active WAL writer
+        special_path = self.home / "conv #1 %20 test.db"
+        wal_db = ConversationDB(special_path)
+        self.addCleanup(wal_db.close)
+        wal_db.conn.execute("PRAGMA journal_mode=WAL")
+        wal_db.step(USER_INPUT, payload_field=P_USER, payload=user_input("hi"))
+        wal_db.step(CHECKPOINT, payload_field=P_CHECKPOINT, payload=m(f(1, 0), f(11, 0), f(12, 1), f(4, "old")), status=3)
+        wal_db.step(CHECKPOINT, payload_field=P_CHECKPOINT, payload=m(f(1, 1), f(11, 1), f(12, 2), f(4, "pending")), status=2)
+        wal_db.step(PLANNER_RESPONSE, metadata=f(9, usage(100, 10)), payload_field=P_PLANNER, payload=planner("ok"))
+        # Generation explicitly omits field 2 (no active checkpoint)
+        cwm = m(f(1, 0), f(3, f(1, group(7, 10, ("0: USER_INPUT", 10)))), f(4, 1_000_000))
+        wal_db.conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (0, ?)", (m(f(1, m(f(9, f(10, cwm))))),))
+        wal_db.conn.commit()
+
+        old_db_path = self.db_path
+        self.db_path = special_path
+        try:
+            r = self.report()
+        finally:
+            self.db_path = old_db_path
+        self.assertEqual(r["active_checkpoint"], -1)
+        self.assertIsNone(r["checkpoint_view"])
+        self.assertEqual(len(r["checkpoints"]), 1)
+
+    def test_latest_stats_alignment_and_old_schema_tolerated(self):
+        self.basic_steps()
+        # Gen 1 completed with output; Gen 2 has input/cache only; Gen 3 output-only
+        self.db.generation([group(7, 1000, ("0: USER_INPUT", 1000))], usage=usage(input_tokens=100, output=400, cache_read=900))
+        self.db.generation([group(7, 1000, ("0: USER_INPUT", 1000))], usage=usage(input_tokens=0, output=120, cache_read=0))
+        r = self.report()
+        self.assertEqual(r["cache_stats"]["generations"], 1)
+        self.assertIsNone(r["cache_stats"]["last_hit_rate"])
+        self.assertEqual(r["cache_stats"]["last_input_tokens"], 0)
+        self.assertEqual(r["output_stats"]["last_output_tokens"], 120)
+        self.assertEqual(r["output_stats"]["session_output_tokens"], 520)
+
+        # Older DB missing task_details / error_details and gen_metadata missing idx
+        legacy_path = self.home / "legacy.db"
+        conn = sqlite3.connect(legacy_path)
+        self.addCleanup(conn.close)
+        conn.execute("CREATE TABLE steps (idx integer PRIMARY KEY, step_type integer, status integer, metadata blob, step_payload blob)")
+        conn.execute("INSERT INTO steps VALUES (0, 14, 3, X'', ?)", (m(f(1, 14), f(4, 3), f(19, user_input("hello!!!"))),))
+        conn.execute("CREATE TABLE gen_metadata (data blob)")
+        cwm = m(f(1, 0), f(3, f(1, group(7, 10, ("0: USER_INPUT", 10)))), f(4, 250_000))
+        conn.execute("INSERT INTO gen_metadata VALUES (?)", (m(f(1, m(f(9, f(10, cwm))))),))
+        conn.commit()
+        old_db_path = self.db_path
+        self.db_path = legacy_path
+        try:
+            legacy_r = self.report()
+        finally:
+            self.db_path = old_db_path
+        self.assertEqual(legacy_r["used_tokens"], 10)
+        self.assertEqual(legacy_r["limit_tokens"], 250_000)
+
+    def test_round2_hardening_edges(self):
+        # 1. Unpaired UTF-16 surrogate in view_file JSON path + stale nonnegative gen_ck + exact 3-token scaling
+        bad_json = '{"AbsolutePath": "\\ud800/tmp/SKILL.md"}'
+        self.db.step(GENERIC, metadata=f(4, m(f(2, "view_file"), f(3, bad_json))), payload_field=140, payload=f(2, b""))
+        self.db.step(USER_INPUT, payload_field=P_USER, payload=user_input("first prompt!!"))
+        self.db.step(CHECKPOINT, payload_field=P_CHECKPOINT, payload=m(f(1, 1), f(11, 0), f(12, 1), f(4, "cp1")), status=3)
+        self.db.step(PLANNER_RESPONSE, metadata=f(9, usage(10, 5)), payload_field=P_PLANNER, payload=planner("reply!!"))
+        self.db.generation([group(7, 3, ("0: UNKNOWN_ITEM", 3))], usage=usage(input_tokens=100, output=10), checkpoint_index=0, model="gemini-2.5-flash", display_name="")
+
+        r_single = self.report()
+        self.assertFalse(r_single["compacted"])
+        cat_sum = sum(c["tokens"] for c in r_single["categories"] if c["key"] in ("user", "agent", "tool", "system_messages"))
+        self.assertEqual(cat_sum, 3)
+
+        # Re-open DB to verify catalog edge cases without invalidating the single-gen check above
+        self.db = ConversationDB.__new__(ConversationDB)
+        self.db.conn = sqlite3.connect(self.db_path)
+        catalog = self.home / "bad_or_ambig.json"
+        catalog.write_text(json.dumps({
+            "gemini-2.5-flash": {"maxTokens": 1_048_576, "displayName": "Shared Flash"},
+            "gemini-3.5-flash-lite": {"maxTokens": 1_048_576, "displayName": "Shared Flash"},
+            "gemini-4-hydrogen-high": {"maxTokens": 10**309, "displayName": 12345},
+        }))
+        # Historical no-ID row should NOT merge when catalog maps Shared Flash to multiple IDs
+        self.db.generation([group(7, 3, ("0: USER_INPUT", 3))], usage=usage(input_tokens=100, output=10), model="", display_name="Shared Flash")
+        # Row with empty planner model_id but response_model slug carrying -high effort
+        resp_slug_chat = m(f(4, usage(input_tokens=100, output=10)), f(19, "gemini-4-hydrogen-high"), f(21, "Gemini 4 Hydrogen (Low)"))
+        self.db.conn.execute("INSERT INTO gen_metadata (idx, data) VALUES ((SELECT COUNT(*) FROM gen_metadata), ?)", (m(f(1, resp_slug_chat)),))
+        # Row with numeric displayName and overflowing maxTokens
+        self.db.generation([group(7, 3, ("0: USER_INPUT", 3))], usage=usage(input_tokens=100, output=10), model="gemini-4-hydrogen-high", display_name="")
+
+        r = self.report("--model-catalog", str(catalog))
+        by_key = {(m["model_id"], m["model"]): m for m in r["model_usage"]}
+        self.assertIn(("gemini-2.5-flash", "Shared Flash"), by_key)
+        self.assertIn(("", "Shared Flash"), by_key)
+        self.assertEqual(by_key[("gemini-4-hydrogen", "Gemini 4 Hydrogen")]["efforts"], {"High": 2})
+        self.assertEqual(r["limit_tokens"], 1_048_576)
+
+        # Corrupt catalog file degrades gracefully instead of aborting
+        corrupt = self.home / "corrupt.json"
+        corrupt.write_text("{not valid json")
+        r_fallback = self.report("--model-catalog", str(corrupt))
+        self.assertEqual(r_fallback["limit_tokens"], 1_048_576)
+
 
 class FormatTest(unittest.TestCase):
     def test_model_label(self):
@@ -639,6 +809,21 @@ class FormatTest(unittest.TestCase):
         }
         for slug, label in cases.items():
             self.assertEqual(context_report.model_label(slug), label)
+
+    def test_uri_to_path_and_varint_bounds(self):
+        self.assertEqual(context_report.uri_to_path("file:///Users/a/b%20c.txt"), "/Users/a/b c.txt")
+        self.assertEqual(context_report.uri_to_path("file://localhost/Users/a/b.txt"), "/Users/a/b.txt")
+        self.assertEqual(context_report.uri_to_path("file:///C:/Users/a/b.txt"), "C:/Users/a/b.txt")
+        self.assertIn("server/share/dir", context_report.uri_to_path("file://server/share/dir").replace("\\", "/"))
+        unc_uri = context_report.sqlite_ro_uri(Path("//server/share/dir/conv #1.db"))
+        self.assertTrue(unc_uri.startswith("file:////server/share/"))
+        self.assertIn("%231", unc_uri)
+
+        # 10th byte > 1 overflows uint64 and must raise ValueError cleanly inside Msg
+        overflow_varint = b"\x80" * 9 + b"\x02"
+        with self.assertRaises(ValueError):
+            context_report.read_varint(overflow_varint, 0)
+        self.assertEqual(context_report.Msg(b"\x08" + overflow_varint).int(1), 0)
 
     def test_native_windows(self):
         for slug, tokens in {"claude-sonnet-5-5-low": 1_000_000, "claude-opus-4-6-thinking": 250_000,

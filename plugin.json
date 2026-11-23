@@ -1,6 +1,6 @@
 {
   "name": "antigravity-status-bar",
-  "title": "Antigravity 状态栏",
+  "displayName": "Antigravity 状态栏",
   "description": "Antigravity 状态栏：Claude Code 风格分段线条上下文占用监控 + 当前会话后台任务实时追踪（支持查看命令、状态与日志）。",
   "version": "1.1.0",
   "logo": "assets/logo.svg"
