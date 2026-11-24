@@ -29,7 +29,7 @@
   body {
     margin: 0;
     color: var(--fg);
-    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", Roboto, sans-serif;
     -webkit-font-smoothing: antialiased;
   }
   ::-webkit-scrollbar { width: 10px; height: 10px; }
@@ -660,7 +660,7 @@
       const cmdLabel = isSubagent ? '任务指令 (Prompt)' : '执行命令';
       const copyLabel = isSubagent ? '复制指令' : '复制命令';
       const cmdDisplay = t.command || (isSubagent ? '(无指令内容)' : '(无命令详情)');
-      const idDisplay = t.task_id ? (isSubagent ? t.task_id.slice(0, 8) : t.task_id.split('/').pop()) : '';
+      const idDisplay = t.task_id ? (isSubagent ? t.task_id.slice(0, 8) : t.task_id.split(/[\\/]/).pop()) : '';
       detailHtml = `
         <div class="task-detail">
           <div class="task-meta-grid">
@@ -966,7 +966,10 @@
     const i = trimmed.lastIndexOf('/');
     const name = trimmed.slice(i + 1) + (norm.endsWith('/') ? '/' : '');
     let dir = i > 0 ? trimmed.slice(0, i) : '';
-    if (conversationId) dir = dir.replace(new RegExp(`^.*/brain/${conversationId}`), 'conversation folder');
+    if (conversationId) {
+      const escCid = conversationId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      dir = dir.replace(new RegExp(`^.*/brain/${escCid}(?=/|$)`, 'i'), 'conversation folder');
+    }
     return { name, dir };
   }
 
@@ -974,7 +977,7 @@
     if (!items || !items.length) return '';
     const rows = items.map((f) => {
       const { name, dir } = splitPath(f.path);
-      return `<li title="${esc(f.path)}"><span class="name">${esc(name)}<span class="dir">‎${esc(dir)}</span></span>`
+      return `<li title="${esc(f.path)}"><span class="name">${esc(name)}<span class="dir">\u200e${esc(dir)}\u200e</span></span>`
         + `<span class="tok num">${f.tokens > 0 ? fmtTok(f.tokens) : ''}</span></li>`;
     }).join('');
     return `<section><h2>${title} <span class="hint">${hint}</span></h2><ul class="files">${rows}</ul></section>`;
@@ -1092,8 +1095,15 @@
         + `</div></div>`;
     }
 
-    const warnHtml = (hasPriced && unpriced > 0)
-      ? `<p class="note cost-warn"><span aria-hidden="true">⚠</span> Excluded ${unpriced} unpriced call(s)${unpricedNames ? ` (${esc(unpricedNames)})` : ''}</p>`
+    const warnParts = [];
+    if (hasPriced && unpriced > 0) {
+      warnParts.push(`Excluded ${unpriced} unpriced call(s)${unpricedNames ? ` (${esc(unpricedNames)})` : ''}`);
+    }
+    if (cs.incomplete) {
+      warnParts.push('Some subagent data was temporarily unavailable');
+    }
+    const warnHtml = warnParts.length
+      ? `<p class="note cost-warn"><span aria-hidden="true">⚠</span> ${warnParts.join(' · ')}</p>`
       : '';
 
     return `<section id="cost-section">`

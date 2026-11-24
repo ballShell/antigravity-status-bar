@@ -18,7 +18,7 @@
 - **多模型用量分布（Models）**：适配 Orchestrator 混用模型场景，自动按基础模型归并不同思考强度，展示当前会话各模型的累计 Token 与占比（单模型会话自动隐藏，详细调用次数与缓存命中率悬停可见）。
 - **后台任务 & Subagent 实时监控**：自动捕捉当前会话的后台命令（`run_command`）、守护进程（`Daemon`）、定时器（`Timer`）及子 Agent（`Subagent`）；点击即可展开查看命令 / Prompt（超长时截断至 32K 字符）、执行状态与实时日志尾部（末尾 32 KB）。
 - **可折叠 Checkpoints 时间线**：自动提炼最近用户请求作为 Checkpoint 语义标题，当前生效项以 `Active` 标识，点击即可展开历史归档记录与时间戳。
-- **零额外消耗 & 自适应主题**：通过 Antigravity Sidecar 每 3 秒只读轮询，模型上下文上限自动同步应用内实时目录，原生自适应明暗主题。
+- **零额外消耗 & 跨平台开箱即用**：通过 Antigravity Sidecar 每 3 秒只读轮询，模型上下文上限自动同步应用内实时目录，原生自适应明暗主题；支持 **macOS / Linux / Windows 10 & 11**（自动跳过 Windows Store 占位符并从 `py`、官方安装目录、Conda/Miniconda、uv、Scoop、venv 及 Windows 注册表发现 Python 3.9+，兼容 UTF-8、PowerShell UTF-16LE 与 CMD GB18030/GBK 日志编码）。
 
 ## 快捷安装
 

@@ -17,11 +17,23 @@ import os
 from pathlib import Path
 import re
 import shutil
-import sqlite3
 import sys
 import tempfile
 import time
 from urllib.parse import quote, unquote, urlparse
+
+# Ensure Conda/Anaconda/Miniconda on Windows 10/11 can locate sqlite3.dll in <prefix>\Library\bin
+# even when invoked outside an activated Conda shell.
+if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+    for _py_prefix in {sys.prefix, getattr(sys, "base_prefix", sys.prefix)}:
+        _conda_bin = Path(_py_prefix) / "Library" / "bin"
+        if _conda_bin.is_dir():
+            try:
+                os.add_dll_directory(str(_conda_bin))
+            except OSError:
+                pass
+
+import sqlite3
 
 # --- protobuf ----------------------------------------------------------------
 
@@ -186,10 +198,24 @@ def go_div4(n: int) -> int:
     return int(n / 4)
 
 
+def _strip_win_extended_prefix(raw: str) -> str:
+    """Strip Win32 extended-length path prefixes for drive and UNC paths only."""
+    if not raw:
+        return raw
+    if raw.startswith("\\\\?\\UNC\\") or raw.startswith("//?/UNC/"):
+        sep = "\\" if raw.startswith("\\") else "/"
+        return sep * 2 + raw[8:]
+    if (raw.startswith("\\\\?\\") or raw.startswith("//?/")) and len(raw) >= 6 and raw[4].isalpha() and raw[5] == ":":
+        return raw[4:]
+    return raw
+
+
 def sqlite_ro_uri(path: Path, immutable: bool = False) -> str:
     """Build a percent-encoded SQLite read-only URI safe for #, ?, %, spaces, drive letters, and UNC shares."""
-    abs_p = Path(os.path.abspath(os.fspath(path)))
-    posix_p = abs_p.as_posix()
+    raw = os.fspath(path)
+    cleaned = _strip_win_extended_prefix(raw) if os.name == "nt" else raw
+    abs_p = Path(os.path.abspath(cleaned))
+    posix_p = (_strip_win_extended_prefix(abs_p.as_posix()) if os.name == "nt" else abs_p.as_posix())
     suffix = "?mode=ro&immutable=1" if immutable else "?mode=ro"
     if posix_p.startswith("//"):
         return "file:////" + quote(posix_p.lstrip("/"), safe="/:") + suffix
@@ -199,22 +225,25 @@ def sqlite_ro_uri(path: Path, immutable: bool = False) -> str:
 def uri_to_path(uri: str) -> str:
     """Convert a file:// URI to a local filesystem path."""
     if not uri or not uri.startswith("file:"):
-        return uri
+        return _strip_win_extended_prefix(uri)
     parsed = urlparse(uri)
     netloc = unquote(parsed.netloc)
     p = unquote(parsed.path)
+    # Handle non-standard two-slash Windows drive URIs like file://C:/Users/...
+    if len(netloc) == 2 and netloc[1] == ":" and netloc[0].isalpha():
+        return f"{netloc}{p}"
     if netloc and netloc.lower() != "localhost":
         if os.name == "nt":
             return "\\\\" + netloc + p.replace("/", "\\")
         return f"//{netloc}{p}"
     if len(p) > 2 and p[0] == "/" and p[2] == ":" and p[1].isalpha():
         p = p[1:]
-    return p
+    return _strip_win_extended_prefix(p)
 
 
 def shorten_path(uri: str) -> str:
-    p = uri_to_path(uri)
-    home = str(Path.home())
+    p = _strip_win_extended_prefix(uri_to_path(uri))
+    home = _strip_win_extended_prefix(str(Path.home()))
     p_norm = p.replace("\\", "/")
     home_norm = home.replace("\\", "/").rstrip("/")
     if home_norm and p_norm == home_norm:
@@ -899,19 +928,76 @@ def _safe_max_tokens(val) -> int:
     return 0
 
 
-def _has_nonempty_wal(db_path: Path) -> bool:
+def _file_sig(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        return None
+
+
+def _wal_state(db_path: Path) -> str:
+    """Return 'absent', 'empty', 'nonempty', or 'unknown' (when stat fails with non-ENOENT OSError)."""
     wal = Path(f"{db_path}-wal")
     try:
-        return wal.is_file() and wal.stat().st_size > 0
+        st = wal.stat()
+        return "nonempty" if st.st_size > 0 else "empty"
+    except FileNotFoundError:
+        return "absent"
     except OSError:
-        return False
+        return "unknown"
+
+
+def _has_nonempty_wal(db_path: Path) -> bool:
+    return _wal_state(db_path) == "nonempty"
+
+
+def _copy_file_retry(src: Path, dst: Path, optional: bool = False) -> bool:
+    """Copy a DB/WAL file with brief retries for transient Windows sharing locks.
+
+    ``optional=True`` only tolerates ``FileNotFoundError``; permission or I/O errors
+    always propagate so callers never query a stale snapshot missing committed WAL rows.
+    """
+    for attempt in range(3):
+        try:
+            shutil.copyfile(src, dst)
+            return True
+        except FileNotFoundError:
+            if optional:
+                return False
+            raise
+        except PermissionError:
+            if attempt < 2:
+                time.sleep(0.03 * (attempt + 1))
+                continue
+            raise
+        except OSError:
+            if attempt < 2:
+                time.sleep(0.03 * (attempt + 1))
+                continue
+            raise
+    return False
+
+
+def _rmtree_retry(path: str) -> None:
+    for attempt in range(3):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt < 2:
+                time.sleep(0.03 * (attempt + 1))
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _query_ro_db(db_path: Path, fn):
     """Run read-only query callback ``fn(conn)`` with busy retries and WAL no-shm fallbacks.
 
     Opening a WAL-mode SQLite DB with ``?mode=ro`` fails with
-    ``OperationalError: unable to open database file`` when no ``-shm`` file
+    ``OperationalError: unable to open database file`` (or ``disk I/O error`` /
+    ``readonly database`` on Windows ``winShmMap``) when no ``-shm`` file
     exists (e.g. cleanly closed historical conversations) or when the process
     cannot create/write ``-shm``.
     """
@@ -927,7 +1013,7 @@ def _query_ro_db(db_path: Path, fn):
             if ("locked" in msg or "busy" in msg) and attempt < 2:
                 time.sleep(0.05 * (attempt + 1))
                 continue
-            if "unable to open database file" in msg:
+            if any(k in msg for k in ("unable to open database file", "disk i/o error", "readonly database")):
                 break
             raise
         finally:
@@ -937,27 +1023,50 @@ def _query_ro_db(db_path: Path, fn):
         assert last_err is not None
         raise last_err
 
-    if not _has_nonempty_wal(db_path):
+    wal_state = _wal_state(db_path)
+    if wal_state in ("absent", "empty"):
         conn = sqlite3.connect(sqlite_ro_uri(db_path, immutable=True), uri=True)
         try:
             return fn(conn)
         finally:
             conn.close()
 
-    with tempfile.TemporaryDirectory(prefix="ag-status-bar-") as tmpdir:
-        tmp_db = Path(tmpdir) / db_path.name
-        shutil.copyfile(db_path, tmp_db)
-        wal = Path(f"{db_path}-wal")
-        if wal.is_file():
-            try:
-                shutil.copyfile(wal, Path(f"{tmp_db}-wal"))
-            except FileNotFoundError:
-                pass
-        conn = sqlite3.connect(tmp_db)
+    # Copy DB + WAL into a temporary directory and verify source signatures did not
+    # shift mid-copy; never silently drop a nonempty/unreadable WAL.
+    wal = Path(f"{db_path}-wal")
+    last_snap_err: Exception | None = None
+    for attempt in range(2):
+        tmpdir = tempfile.mkdtemp(prefix="ag-status-bar-")
         try:
-            return fn(conn)
+            db_sig_before = _file_sig(db_path)
+            wal_sig_before = _file_sig(wal)
+            tmp_db = Path(tmpdir) / db_path.name
+            _copy_file_retry(db_path, tmp_db, optional=False)
+            wal_required = wal_state == "nonempty" or wal_sig_before is not None
+            _copy_file_retry(wal, Path(f"{tmp_db}-wal"), optional=not wal_required)
+            db_sig_after = _file_sig(db_path)
+            wal_sig_after = _file_sig(wal)
+            if db_sig_before != db_sig_after or wal_sig_before != wal_sig_after:
+                last_snap_err = sqlite3.OperationalError("Database or WAL changed during snapshot copy")
+                if attempt == 0:
+                    time.sleep(0.05)
+                    continue
+                raise last_snap_err
+            conn = sqlite3.connect(tmp_db)
+            try:
+                return fn(conn)
+            finally:
+                conn.close()
+        except OSError as exc:
+            last_snap_err = sqlite3.OperationalError(f"Failed to create consistent SQLite snapshot: {exc}")
+            if attempt == 0:
+                time.sleep(0.05)
+                continue
+            raise last_snap_err from exc
         finally:
-            conn.close()
+            _rmtree_retry(tmpdir)
+    assert last_snap_err is not None
+    raise last_snap_err
 
 
 def _subagent_db_status(db_path: Path | None, sub_conv_id: str) -> str:
@@ -1893,6 +2002,8 @@ def collect_session_cost(
     merged_unpriced = dict(unpriced_models)
     sub_ids_seen: set[str] = {db_path.stem.lower()}
     sub_db_ids: list[str] = []
+    missing_sub_ids: list[str] = []
+    failed_sub_ids: list[str] = []
     sub_evaluated: list = []
     sub_with_calls = 0
 
@@ -1904,15 +2015,17 @@ def collect_session_cost(
             sub_ids_seen.add(cid.lower())
             queue.append((cid, 1))
 
-    while queue and len(sub_db_ids) < max_sub_dbs:
+    while queue and (len(sub_db_ids) + len(missing_sub_ids)) < max_sub_dbs:
         cid, depth = queue.popleft()
         sub_db = db_path.parent / f"{cid}.db"
         if not sub_db.is_file():
+            missing_sub_ids.append(cid)
             continue
         sub_db_ids.append(cid)
         try:
             sub_steps, sub_gens = _read_subagent_cost_rows(sub_db)
-        except sqlite3.Error:
+        except (sqlite3.Error, OSError):
+            failed_sub_ids.append(cid)
             continue
 
         if depth < max_depth:
@@ -1969,6 +2082,9 @@ def collect_session_cost(
         "main_breakdown": _bucket_summary(main_bucket),
         "subagent_breakdown": _bucket_summary(sub_bucket, count=sub_with_calls),
         "subagent_conversation_ids": sub_db_ids,
+        "missing_subagent_ids": missing_sub_ids,
+        "incomplete": bool(failed_sub_ids),
+        "failed_subagent_count": len(failed_sub_ids),
     }
 
 
@@ -2151,14 +2267,22 @@ def main():
         except ValueError as exc:
             raise SystemExit(f"Invalid --price-date '{args.price_date}' (expected YYYY-MM-DD): {exc}") from exc
 
+    effective_app_dir = args.app_dir
     if args.db:
         db_path = Path(args.db).expanduser()
         conv_id = db_path.stem
         effective_gemini_dir = args.gemini_dir
     else:
         effective_gemini_dir = args.gemini_dir or os.environ.get("ANTIGRAVITY_GEMINI_DIR")
-        gemini_root = Path(effective_gemini_dir).expanduser() if effective_gemini_dir else (Path.home() / ".gemini")
-        conv_dir = gemini_root / args.app_dir / "conversations"
+        env_app_data = os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "").strip()
+        if not effective_gemini_dir and env_app_data and args.app_dir == "antigravity":
+            app_data_path = Path(env_app_data).expanduser()
+            effective_gemini_dir = str(app_data_path.parent)
+            effective_app_dir = app_data_path.name or "antigravity"
+            conv_dir = app_data_path / "conversations"
+        else:
+            gemini_root = Path(effective_gemini_dir).expanduser() if effective_gemini_dir else (Path.home() / ".gemini")
+            conv_dir = gemini_root / effective_app_dir / "conversations"
         conv_id = args.conversation_id
         if not conv_id:
             dbs = sorted(conv_dir.glob("*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -2187,7 +2311,7 @@ def main():
     limit = args.limit if args.limit > 0 else cat_max or context_limit(gen)
     st = collect_stats(steps, gen, limit)
     model = _safe_str(catalog_entry.get("displayName")) or model_name(gen)
-    system_files = detect_system_files(os.path.expanduser("~"), args.workspace, args.app_dir, gemini_dir=effective_gemini_dir)
+    system_files = detect_system_files(os.path.expanduser("~"), args.workspace, effective_app_dir, gemini_dir=effective_gemini_dir)
 
     if args.json:
         print(json.dumps({

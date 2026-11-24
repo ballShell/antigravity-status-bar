@@ -896,10 +896,39 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(context_report.uri_to_path("file:///Users/a/b%20c.txt"), "/Users/a/b c.txt")
         self.assertEqual(context_report.uri_to_path("file://localhost/Users/a/b.txt"), "/Users/a/b.txt")
         self.assertEqual(context_report.uri_to_path("file:///C:/Users/a/b.txt"), "C:/Users/a/b.txt")
+        self.assertEqual(context_report.uri_to_path("file:///e%3A/project1/repo"), "e:/project1/repo")
+        self.assertEqual(context_report.uri_to_path("file://C:/Users/a/b.txt"), "C:/Users/a/b.txt")
+        self.assertEqual(context_report._strip_win_extended_prefix("\\\\?\\C:\\Users\\a\\b.db"), "C:\\Users\\a\\b.db")
+        self.assertEqual(context_report._strip_win_extended_prefix("\\\\?\\UNC\\server\\share\\b.db"), "\\\\server\\share\\b.db")
         self.assertIn("server/share/dir", context_report.uri_to_path("file://server/share/dir").replace("\\", "/"))
         unc_uri = context_report.sqlite_ro_uri(Path("//server/share/dir/conv #1.db"))
         self.assertTrue(unc_uri.startswith("file:////server/share/"))
         self.assertIn("%231", unc_uri)
+
+        # Windows SQLite winShmMap "disk I/O error" / "readonly database" falls back cleanly to immutable/copy
+        orig_connect = sqlite3.connect
+        calls = []
+
+        def flaky_ro_connect(target, *args, **kwargs):
+            calls.append(str(target))
+            if isinstance(target, str) and target.endswith("?mode=ro"):
+                raise sqlite3.OperationalError("disk I/O error")
+            return orig_connect(target, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ro_db = Path(tmp) / "win_shm_fail.db"
+            c = orig_connect(ro_db)
+            c.execute("CREATE TABLE t (v INT)")
+            c.execute("INSERT INTO t VALUES (99)")
+            c.commit()
+            c.close()
+            sqlite3.connect = flaky_ro_connect
+            try:
+                val = context_report._query_ro_db(ro_db, lambda conn: conn.execute("SELECT v FROM t").fetchone()[0])
+            finally:
+                sqlite3.connect = orig_connect
+            self.assertEqual(val, 99)
+            self.assertGreaterEqual(len(calls), 2)
 
         # 10th byte > 1 overflows uint64 and must raise ValueError cleanly inside Msg
         overflow_varint = b"\x80" * 9 + b"\x02"
@@ -1130,6 +1159,60 @@ class CostEstimateTest(unittest.TestCase):
             capture_output=True, text=True, encoding="utf-8",
         )
         self.assertNotEqual(bad_res.returncode, 0)
+
+    def test_query_ro_db_rejects_failed_wal_copy(self):
+        from unittest import mock
+
+        db_path = self.home / "wal_denied.db"
+        db = ConversationDB(db_path)
+        db.generation([group(7, 100, ("0: USER_INPUT", 100))], usage=usage(input_tokens=1000, output=100))
+        db.close()
+
+        wal_path = Path(f"{db_path}-wal")
+        wal_path.write_bytes(b"\x00" * 4096)
+
+        real_connect = context_report.sqlite3.connect
+        real_copyfile = context_report.shutil.copyfile
+
+        def fake_connect(target, *args, **kwargs):
+            if isinstance(target, str) and target.startswith("file:"):
+                raise context_report.sqlite3.OperationalError("unable to open database file")
+            return real_connect(target, *args, **kwargs)
+
+        def fake_copyfile(src, dst, *args, **kwargs):
+            if Path(src) == wal_path:
+                raise PermissionError("sharing violation on WAL")
+            return real_copyfile(src, dst, *args, **kwargs)
+
+        with mock.patch.object(context_report.sqlite3, "connect", side_effect=fake_connect), \
+                mock.patch.object(context_report.shutil, "copyfile", side_effect=fake_copyfile), \
+                mock.patch.object(context_report.time, "sleep", return_value=None):
+            with self.assertRaises(context_report.sqlite3.OperationalError):
+                context_report._query_ro_db(db_path, lambda conn: conn.execute("SELECT 1").fetchall())
+
+    def test_collect_session_cost_tracks_missing_and_unreadable_subagents(self):
+        conv_dir = self.home / "convs_partial"
+        conv_dir.mkdir()
+        missing_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        broken_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        main_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+
+        broken_db_path = conv_dir / f"{broken_id}.db"
+        broken_db_path.write_bytes(b"not-a-valid-sqlite-db")
+
+        main_db_path = conv_dir / f"{main_id}.db"
+        main = ConversationDB(main_db_path)
+        self._subagent_step(main, missing_id)
+        self._subagent_step(main, broken_id)
+        main.generation([group(7, 100, ("0: USER_INPUT", 100))], usage=usage(input_tokens=1_000_000, output=0), model="gemini-4-hydrogen-high", display_name="")
+        main.close()
+
+        r = self._run_json(main_db_path, "--price-date", "2026-11-24")
+        cs = r["cost_stats"]
+        self.assertIn(missing_id, cs["missing_subagent_ids"])
+        self.assertIn(broken_id, cs["subagent_conversation_ids"])
+        self.assertTrue(cs["incomplete"])
+        self.assertEqual(cs["failed_subagent_count"], 1)
 
 
 if __name__ == "__main__":
