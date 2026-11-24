@@ -12,7 +12,7 @@ A live side-panel status bar plugin for the **Antigravity 2.0 desktop app** — 
 - **Unified Token Usage (Cache Hit & Output Stats)**: Shows per-category token usage alongside compact inline rows for `Cache hit` (latest turn + session cumulative hit rate) and `Output` (total output + thinking token share).
 - **Per-Model Usage Breakdown (`Models`)**: Built for Orchestrator / multi-model sessions — summarizes call counts, cumulative token share, and cache hit rate per model (automatically hidden in single-model conversations).
 - **Background Tasks & Subagents Monitor**: Captures active and recent `run_command` jobs, `Daemon` processes, `Timer` schedules, and `Subagent` invocations; click any item to inspect the command/prompt (clipped above 32K chars), status, and live log tail (last 32 KB).
-- **Zero Token Cost & Native Theming**: Polls locally every 3 seconds via Antigravity Sidecar, syncs live context limits from the app's model catalog, and adapts automatically to light/dark themes.
+- **Zero Token Cost & Cross-Platform Ready**: Polls locally every 3 seconds via Antigravity Sidecar, syncs live context limits from the app's model catalog, adapts automatically to light/dark themes, and runs seamlessly across **macOS, Linux, and Windows 10/11** (automatically skips Microsoft Store alias stubs, discovers Python 3.9+ from `py`, official installers, Conda/Miniconda, uv, Scoop, and the Windows Registry, and decodes UTF-8, PowerShell UTF-16LE, and GB18030/GBK task logs).
 
 ## Quick Install
 

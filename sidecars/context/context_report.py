@@ -15,11 +15,23 @@ import os
 from pathlib import Path
 import re
 import shutil
-import sqlite3
 import sys
 import tempfile
 import time
 from urllib.parse import quote, unquote, urlparse
+
+# Ensure Conda/Anaconda/Miniconda on Windows 10/11 can locate sqlite3.dll in <prefix>\Library\bin
+# even when invoked outside an activated Conda shell.
+if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+    for _py_prefix in {sys.prefix, getattr(sys, "base_prefix", sys.prefix)}:
+        _conda_bin = Path(_py_prefix) / "Library" / "bin"
+        if _conda_bin.is_dir():
+            try:
+                os.add_dll_directory(str(_conda_bin))
+            except OSError:
+                pass
+
+import sqlite3
 
 # --- protobuf ----------------------------------------------------------------
 
@@ -172,10 +184,21 @@ def go_div4(n: int) -> int:
     return int(n / 4)
 
 
+def _strip_win_extended_prefix(raw: str) -> str:
+    """Strip Win32 extended-length path prefixes (\\\\?\\C:\\... or \\\\?\\UNC\\server\\share)."""
+    if raw.startswith("\\\\?\\UNC\\") or raw.startswith("//?/UNC/"):
+        sep = "\\" if raw.startswith("\\") else "/"
+        return sep * 2 + raw[8:]
+    if raw.startswith("\\\\?\\") or raw.startswith("//?/"):
+        return raw[4:]
+    return raw
+
+
 def sqlite_ro_uri(path: Path, immutable: bool = False) -> str:
     """Build a percent-encoded SQLite read-only URI safe for #, ?, %, spaces, drive letters, and UNC shares."""
-    abs_p = Path(os.path.abspath(os.fspath(path)))
-    posix_p = abs_p.as_posix()
+    cleaned = _strip_win_extended_prefix(os.fspath(path))
+    abs_p = Path(os.path.abspath(cleaned))
+    posix_p = _strip_win_extended_prefix(abs_p.as_posix())
     suffix = "?mode=ro&immutable=1" if immutable else "?mode=ro"
     if posix_p.startswith("//"):
         return "file:////" + quote(posix_p.lstrip("/"), safe="/:") + suffix
@@ -185,22 +208,25 @@ def sqlite_ro_uri(path: Path, immutable: bool = False) -> str:
 def uri_to_path(uri: str) -> str:
     """Convert a file:// URI to a local filesystem path."""
     if not uri or not uri.startswith("file:"):
-        return uri
+        return _strip_win_extended_prefix(uri)
     parsed = urlparse(uri)
     netloc = unquote(parsed.netloc)
     p = unquote(parsed.path)
+    # Handle non-standard two-slash Windows drive URIs like file://C:/Users/...
+    if len(netloc) == 2 and netloc[1] == ":" and netloc[0].isalpha():
+        return f"{netloc}{p}"
     if netloc and netloc.lower() != "localhost":
         if os.name == "nt":
             return "\\\\" + netloc + p.replace("/", "\\")
         return f"//{netloc}{p}"
     if len(p) > 2 and p[0] == "/" and p[2] == ":" and p[1].isalpha():
         p = p[1:]
-    return p
+    return _strip_win_extended_prefix(p)
 
 
 def shorten_path(uri: str) -> str:
-    p = uri_to_path(uri)
-    home = str(Path.home())
+    p = _strip_win_extended_prefix(uri_to_path(uri))
+    home = _strip_win_extended_prefix(str(Path.home()))
     p_norm = p.replace("\\", "/")
     home_norm = home.replace("\\", "/").rstrip("/")
     if home_norm and p_norm == home_norm:
@@ -814,11 +840,35 @@ def _has_nonempty_wal(db_path: Path) -> bool:
         return False
 
 
+def _copy_file_retry(src: Path, dst: Path, optional: bool = False) -> None:
+    """Copy a DB/WAL file with brief retries for transient Windows sharing locks."""
+    for attempt in range(3):
+        try:
+            shutil.copyfile(src, dst)
+            return
+        except FileNotFoundError:
+            if optional:
+                return
+            raise
+        except PermissionError:
+            if attempt < 2:
+                time.sleep(0.03 * (attempt + 1))
+                continue
+            if optional:
+                return
+            raise
+        except OSError:
+            if optional:
+                return
+            raise
+
+
 def _query_ro_db(db_path: Path, fn):
     """Run read-only query callback ``fn(conn)`` with busy retries and WAL no-shm fallbacks.
 
     Opening a WAL-mode SQLite DB with ``?mode=ro`` fails with
-    ``OperationalError: unable to open database file`` when no ``-shm`` file
+    ``OperationalError: unable to open database file`` (or ``disk I/O error`` /
+    ``readonly database`` on Windows ``winShmMap``) when no ``-shm`` file
     exists (e.g. cleanly closed historical conversations) or when the process
     cannot create/write ``-shm``.
     """
@@ -834,7 +884,7 @@ def _query_ro_db(db_path: Path, fn):
             if ("locked" in msg or "busy" in msg) and attempt < 2:
                 time.sleep(0.05 * (attempt + 1))
                 continue
-            if "unable to open database file" in msg:
+            if any(k in msg for k in ("unable to open database file", "disk i/o error", "readonly database")):
                 break
             raise
         finally:
@@ -851,20 +901,22 @@ def _query_ro_db(db_path: Path, fn):
         finally:
             conn.close()
 
-    with tempfile.TemporaryDirectory(prefix="ag-status-bar-") as tmpdir:
+    # Use manual mkdtemp + ignore_errors cleanup so Python 3.9+ on Windows never
+    # crashes with [WinError 32] if Defender/Indexer holds the temp -shm handle briefly.
+    tmpdir = tempfile.mkdtemp(prefix="ag-status-bar-")
+    try:
         tmp_db = Path(tmpdir) / db_path.name
-        shutil.copyfile(db_path, tmp_db)
+        _copy_file_retry(db_path, tmp_db, optional=False)
         wal = Path(f"{db_path}-wal")
         if wal.is_file():
-            try:
-                shutil.copyfile(wal, Path(f"{tmp_db}-wal"))
-            except FileNotFoundError:
-                pass
+            _copy_file_retry(wal, Path(f"{tmp_db}-wal"), optional=True)
         conn = sqlite3.connect(tmp_db)
         try:
             return fn(conn)
         finally:
             conn.close()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _subagent_db_status(db_path: Path | None, sub_conv_id: str) -> str:
@@ -1438,8 +1490,14 @@ def main():
         effective_gemini_dir = args.gemini_dir
     else:
         effective_gemini_dir = args.gemini_dir or os.environ.get("ANTIGRAVITY_GEMINI_DIR")
-        gemini_root = Path(effective_gemini_dir).expanduser() if effective_gemini_dir else (Path.home() / ".gemini")
-        conv_dir = gemini_root / args.app_dir / "conversations"
+        env_app_data = os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "").strip()
+        if not effective_gemini_dir and env_app_data and args.app_dir == "antigravity":
+            app_data_path = Path(env_app_data).expanduser()
+            effective_gemini_dir = str(app_data_path.parent)
+            conv_dir = app_data_path / "conversations"
+        else:
+            gemini_root = Path(effective_gemini_dir).expanduser() if effective_gemini_dir else (Path.home() / ".gemini")
+            conv_dir = gemini_root / args.app_dir / "conversations"
         conv_id = args.conversation_id
         if not conv_id:
             dbs = sorted(conv_dir.glob("*.db"), key=lambda p: p.stat().st_mtime, reverse=True)

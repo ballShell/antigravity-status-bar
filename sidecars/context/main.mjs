@@ -6,7 +6,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Response, SidecarApp } from 'sidecar_sdk';
@@ -15,12 +14,16 @@ import {
   UUID,
   collectDependencyStamps,
   dependencyStampsMatch,
+  discoverWindowsPythonCandidates,
   execAsync,
   fileStamp,
   isLoopbackHostname,
   normalizeCatalogResponse,
+  normalizeLsHostname,
   probePython,
+  queryWindowsRegistryPython,
   readTaskLogSafe,
+  resolveAppPaths,
   snapshotDependencyStamps,
   stampsUnchanged,
   workspacePath,
@@ -29,8 +32,11 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = join(HERE, 'context_report.py');
-const GEMINI_DIR = process.env.ANTIGRAVITY_GEMINI_DIR || join(homedir(), '.gemini');
-const CONVERSATIONS = join(GEMINI_DIR, 'antigravity', 'conversations');
+const APP_PATHS = resolveAppPaths();
+const GEMINI_DIR = APP_PATHS.geminiDir;
+const APP_DATA_DIR = APP_PATHS.appDataDir;
+const APP_DIR_NAME = APP_PATHS.appDirName;
+const CONVERSATIONS = join(APP_DATA_DIR, 'conversations');
 const DATA_DIR = process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR || join(HERE, '.data');
 const CATALOG_PATH = join(DATA_DIR, 'model-catalog.json');
 const CATALOG_TTL_MS = 10 * 60 * 1000;
@@ -42,14 +48,26 @@ const app = new SidecarApp();
 
 // --- python -------------------------------------------------------------------
 
-const PYTHON_CANDIDATES = process.platform === 'win32'
-  ? [['py', ['-3']], ['python', []], ['python3', []]]
-  : [['python3', []], ['python', []]];
+function buildPythonCandidates() {
+  if (process.platform === 'win32') {
+    return discoverWindowsPythonCandidates();
+  }
+  const list = [];
+  if (process.env.ANTIGRAVITY_PYTHON) {
+    list.push([process.env.ANTIGRAVITY_PYTHON.trim(), []]);
+  }
+  list.push(['python3', []], ['python', []]);
+  return list;
+}
+
 let pythonPromise = null;
 
 function findPython() {
   if (!pythonPromise) {
-    pythonPromise = probePython(PYTHON_CANDIDATES, execAsync).catch((err) => {
+    const extra = process.platform === 'win32'
+      ? () => queryWindowsRegistryPython(execAsync)
+      : null;
+    pythonPromise = probePython(buildPythonCandidates(), execAsync, extra).catch((err) => {
       pythonPromise = null;
       throw err;
     });
@@ -68,14 +86,15 @@ function lsRequest(method, body) {
   const csrf = (process.env.ANTIGRAVITY_CSRF_TOKEN || '').trim();
   if (!addr || !csrf) return Promise.reject(new Error('no language server address'));
   const base = new URL(addr.startsWith('http') ? addr : `http://${addr}`);
+  const hostname = normalizeLsHostname(base.hostname);
   const data = JSON.stringify(body);
   const transport = base.protocol === 'https:' ? https : http;
-  const loopback = isLoopbackHostname(base.hostname);
+  const loopback = isLoopbackHostname(hostname);
 
   return new Promise((resolve, reject) => {
     const req = transport.request(
       {
-        hostname: base.hostname,
+        hostname,
         port: base.port,
         path: `/exa.language_server_pb.LanguageServerService/${method}`,
         method: 'POST',
@@ -86,6 +105,7 @@ function lsRequest(method, body) {
           'Content-Length': Buffer.byteLength(data),
         },
         timeout: 5000,
+        autoSelectFamily: true,
         rejectUnauthorized: !loopback,
       },
       (res) => {
@@ -174,7 +194,7 @@ async function report(conversationId, workspaceUri) {
   }
   await refreshCatalog();
   const workspace = workspacePath(workspaceUri);
-  const tasksDir = join(GEMINI_DIR, 'antigravity', 'brain', conversationId, '.system_generated', 'tasks');
+  const tasksDir = join(APP_DATA_DIR, 'brain', conversationId, '.system_generated', 'tasks');
   const dbStamp = fileStamp(db);
   const walStamp = fileStamp(`${db}-wal`);
   const scriptStamp = fileStamp(SCRIPT);
@@ -201,16 +221,16 @@ async function report(conversationId, workspaceUri) {
     const runStartedMs = Date.now();
     const baseStamps = cached
       ? snapshotDependencyStamps(cached.depStamps)
-      : collectDependencyStamps(null, CONVERSATIONS, tasksDir, GEMINI_DIR, workspace);
+      : collectDependencyStamps(null, CONVERSATIONS, tasksDir, GEMINI_DIR, workspace, APP_DIR_NAME);
     const { cmd, pre } = await findPython();
-    const args = [...pre, SCRIPT, '--db', db, '--json'];
-    if (process.env.ANTIGRAVITY_GEMINI_DIR) args.push('--gemini-dir', GEMINI_DIR);
+    const args = [...pre, SCRIPT, '--db', db, '--json', '--gemini-dir', GEMINI_DIR];
+    if (APP_DIR_NAME !== 'antigravity') args.push('--app-dir', APP_DIR_NAME);
     if (existsSync(CATALOG_PATH)) args.push('--model-catalog', CATALOG_PATH);
     if (workspace) args.push('--workspace', workspace);
     const out = await execAsync(cmd, args);
     const parsed = JSON.parse(out);
     const result = { ...parsed, updatedAt: new Date().toISOString() };
-    const depStamps = collectDependencyStamps(parsed, CONVERSATIONS, tasksDir, GEMINI_DIR, workspace);
+    const depStamps = collectDependencyStamps(parsed, CONVERSATIONS, tasksDir, GEMINI_DIR, workspace, APP_DIR_NAME);
     const inputsStillFresh = fileStamp(db) === dbStamp
       && fileStamp(`${db}-wal`) === walStamp
       && fileStamp(CATALOG_PATH) === catalogStamp
@@ -241,7 +261,10 @@ app.api('/api/report', async (data) => {
 
 app.api('/api/task-log', async (data) => {
   try {
-    return readTaskLogSafe(GEMINI_DIR, data.conversationId, data.stepIdx);
+    return readTaskLogSafe(GEMINI_DIR, data.conversationId, data.stepIdx, {
+      taskId: data.taskId,
+      appDirName: APP_DIR_NAME,
+    });
   } catch (err) {
     return { error: 'failed', message: err.message };
   }

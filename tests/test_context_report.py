@@ -870,10 +870,39 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(context_report.uri_to_path("file:///Users/a/b%20c.txt"), "/Users/a/b c.txt")
         self.assertEqual(context_report.uri_to_path("file://localhost/Users/a/b.txt"), "/Users/a/b.txt")
         self.assertEqual(context_report.uri_to_path("file:///C:/Users/a/b.txt"), "C:/Users/a/b.txt")
+        self.assertEqual(context_report.uri_to_path("file:///e%3A/project1/repo"), "e:/project1/repo")
+        self.assertEqual(context_report.uri_to_path("file://C:/Users/a/b.txt"), "C:/Users/a/b.txt")
+        self.assertEqual(context_report._strip_win_extended_prefix("\\\\?\\C:\\Users\\a\\b.db"), "C:\\Users\\a\\b.db")
+        self.assertEqual(context_report._strip_win_extended_prefix("\\\\?\\UNC\\server\\share\\b.db"), "\\\\server\\share\\b.db")
         self.assertIn("server/share/dir", context_report.uri_to_path("file://server/share/dir").replace("\\", "/"))
         unc_uri = context_report.sqlite_ro_uri(Path("//server/share/dir/conv #1.db"))
         self.assertTrue(unc_uri.startswith("file:////server/share/"))
         self.assertIn("%231", unc_uri)
+
+        # Windows SQLite winShmMap "disk I/O error" / "readonly database" falls back cleanly to immutable/copy
+        orig_connect = sqlite3.connect
+        calls = []
+
+        def flaky_ro_connect(target, *args, **kwargs):
+            calls.append(str(target))
+            if isinstance(target, str) and target.endswith("?mode=ro"):
+                raise sqlite3.OperationalError("disk I/O error")
+            return orig_connect(target, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ro_db = Path(tmp) / "win_shm_fail.db"
+            c = orig_connect(ro_db)
+            c.execute("CREATE TABLE t (v INT)")
+            c.execute("INSERT INTO t VALUES (99)")
+            c.commit()
+            c.close()
+            sqlite3.connect = flaky_ro_connect
+            try:
+                val = context_report._query_ro_db(ro_db, lambda conn: conn.execute("SELECT v FROM t").fetchone()[0])
+            finally:
+                sqlite3.connect = orig_connect
+            self.assertEqual(val, 99)
+            self.assertGreaterEqual(len(calls), 2)
 
         # 10th byte > 1 overflows uint64 and must raise ValueError cleanly inside Msg
         overflow_varint = b"\x80" * 9 + b"\x02"
