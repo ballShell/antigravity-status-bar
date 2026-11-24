@@ -186,6 +186,21 @@ test('dependencyStampsMatch and stampsUnchanged detect mid-run child/log updates
     writeFileSync(subDb, 'v2-longer', 'utf8');
     assert.equal(dependencyStampsMatch(stamps), false);
     assert.equal(stampsUnchanged(before, collectDependencyStamps({ background_tasks: [{ tool: 'invoke_subagent', task_id: subId }] }, convDir, tasksDir, geminiDir, '')), false);
+
+    // Nested descendant subagent IDs inside cost_stats also trigger cache invalidation
+    const grandId = '66666666-6666-6666-6666-666666666666';
+    const grandDb = join(convDir, `${grandId}.db`);
+    writeFileSync(grandDb, 'g1', 'utf8');
+    const nestedStamps = collectDependencyStamps(
+      { cost_stats: { subagent_conversation_ids: [grandId] } },
+      convDir,
+      tasksDir,
+      geminiDir,
+      '',
+    );
+    assert.equal(dependencyStampsMatch(nestedStamps), true);
+    writeFileSync(grandDb, 'g2-updated', 'utf8');
+    assert.equal(dependencyStampsMatch(nestedStamps), false);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }

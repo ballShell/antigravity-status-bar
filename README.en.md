@@ -4,14 +4,18 @@
 
 A live side-panel status bar plugin for the **Antigravity 2.0 desktop app** — reads the conversation's local SQLite + Protobuf database read-only with **0 tokens consumed per refresh**.
 
-![Antigravity Status Bar Preview](docs/img/preview.png)
+<p align="center">
+  <img src="docs/img/preview.png" alt="Antigravity Status Bar Preview" width="340">
+</p>
 
 ## Features
 
 - **Claude Code Style Segmented Context Bar**: Color-coded proportional bar (`System / User / Agent / Tools / Custom / SysMsg`) with a **request-budget / compaction threshold tick mark**; hover any segment to inspect token counts and highlight matching breakdown rows.
 - **Unified Token Usage (Cache Hit & Output Stats)**: Shows per-category token usage alongside compact inline rows for `Cache hit` (latest turn + session cumulative hit rate) and `Output` (total output + thinking token share).
-- **Per-Model Usage Breakdown (`Models`)**: Built for Orchestrator / multi-model sessions — summarizes call counts, cumulative token share, and cache hit rate per model (automatically hidden in single-model conversations).
+- **Estimated Session API Cost (USD)**: Converts cumulative `uncached input`, `cache read`, and `output (incl. thinking)` tokens into equivalent USD using published Google Gemini / Anthropic Claude API list prices (including scheduled rate changes and long-context tiers). `Total` and `Subagents` each have an independent collapsible breakdown by model (reference estimate only, not subscription billing).
+- **Per-Model Usage Breakdown (`Models`)**: Built for Orchestrator / multi-model sessions — groups thinking-effort variants by base model and shows cumulative token share per model (automatically hidden in single-model conversations; call counts and cache hit details appear on hover).
 - **Background Tasks & Subagents Monitor**: Captures active and recent `run_command` jobs, `Daemon` processes, `Timer` schedules, and `Subagent` invocations; click any item to inspect the command/prompt (clipped above 32K chars), status, and live log tail (last 32 KB).
+- **Collapsible Checkpoints Timeline**: Extracts recent user requests as readable checkpoint labels, marks the active checkpoint with `Active`, and lets you expand archived checkpoints with timestamps on demand.
 - **Zero Token Cost & Native Theming**: Polls locally every 3 seconds via Antigravity Sidecar, syncs live context limits from the app's model catalog, and adapts automatically to light/dark themes.
 
 ## Quick Install

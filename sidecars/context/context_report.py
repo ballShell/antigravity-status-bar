@@ -9,6 +9,8 @@ protobufs from the conversation database (`steps` and `gen_metadata` tables).
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from datetime import date, datetime, timezone
 import json
 import math
 import os
@@ -165,6 +167,18 @@ def fmt_tok(n: int) -> str:
 
 def fmt_ctx_limit(n: int) -> str:
     return fmt_tok(n)
+
+
+def fmt_usd(amount: float | None) -> str:
+    if amount is None:
+        return "-"
+    if amount <= 0:
+        return "$0.00"
+    if amount < 0.01:
+        return f"${amount:.4f}"
+    if amount < 0.10:
+        return f"${amount:.3f}"
+    return f"${amount:.2f}"
 
 
 def go_div4(n: int) -> int:
@@ -438,6 +452,18 @@ def detect_system_files(home: str, workspace: str | None, app_dir: str, gemini_d
     return [(p, 0) for p in found]
 
 
+def _checkpoint_request_label(ck: Msg) -> str:
+    """Pick the most recent meaningful user request inside a checkpoint."""
+    reqs = [re.sub(r"\s+", " ", rm.str(1)).strip() for rm in ck.msgs(30)]
+    for req in reversed(reqs):
+        if req and not req.startswith("/"):
+            return req
+    for req in reversed(reqs):
+        if req and not req.lower().startswith("/compact"):
+            return req
+    return ""
+
+
 def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> dict:
     st = {k: 0 for k in (
         "user", "agent", "tool", "checkpoint", "system_messages", "system_prompt", "system_tools",
@@ -469,11 +495,15 @@ def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> dict:
             st["checkpoint"] += tok
             ck = step.payload(STEP_CHECKPOINT)
             if ck is not None and step.status == STATUS_DONE:
+                ts_msg = step.md.msg(1)
+                created_at = ts_msg.int(1) if ts_msg is not None else 0
                 checkpoints.append({
                     "index": ck.int(1),
                     "start": ck.int(11),
                     "end": ck.int(12),
                     "intent": ck.str(4),
+                    "request_label": _checkpoint_request_label(ck),
+                    "created_at": created_at,
                 })
         else:
             st["system_messages"] += counted
@@ -673,6 +703,19 @@ def render_grid(st: dict, width: int, rows: int, color: bool) -> list[str]:
     return [" ".join(cells[r * cols : (r + 1) * cols]) for r in range(len(cells) // cols)]
 
 
+def _clip_utf8_ellipsis(text: str, max_bytes: int = 70) -> str:
+    if len(text.encode()) <= max_bytes:
+        return text
+    return text.encode()[: max_bytes - 3].decode("utf-8", errors="ignore") + "..."
+
+
+def _checkpoint_display_text(ck: dict) -> str:
+    raw = ck.get("intent") or ck.get("request_label") or ""
+    if raw:
+        return _clip_utf8_ellipsis(raw, 70)
+    return f"steps {ck['start']}–{ck['end']}"
+
+
 def checkpoint_view(st: dict) -> dict | None:
     cks = st["checkpoints"]
     if not cks or st["active_checkpoint"] < 0:
@@ -685,12 +728,25 @@ def checkpoint_view(st: dict) -> dict | None:
             historical += 1
     if active is None:
         return None
-    text = active["intent"]
-    if len(text.encode()) > 70:
-        text = text.encode()[:67].decode("utf-8", errors="ignore") + "..."
-    if not text:
-        text = f"steps {active['start']}–{active['end']}"
-    return {"count": len(cks), "active_number": active["index"] + 1, "active_text": text, "historical": historical}
+    text = _checkpoint_display_text(active)
+    items = [
+        {
+            "number": ck["index"] + 1,
+            "text": _checkpoint_display_text(ck),
+            "start": ck["start"],
+            "end": ck["end"],
+            "created_at": ck.get("created_at", 0),
+            "active": ck["index"] == st["active_checkpoint"],
+        }
+        for ck in sorted(cks, key=lambda c: c["index"], reverse=True)
+    ]
+    return {
+        "count": len(cks),
+        "active_number": active["index"] + 1,
+        "active_text": text,
+        "historical": historical,
+        "items": items,
+    }
 
 
 def render_checkpoints(st: dict) -> str:
@@ -715,7 +771,41 @@ def render_file_section(title: str, subtitle: str, items: list[tuple[str, int]])
     return "".join(out)
 
 
-def render(st: dict, model: str, system_files: list[tuple[str, int]], term_width: int, color: bool) -> str:
+def render_cost(cost_stats: dict | None) -> str:
+    if not cost_stats or not cost_stats.get("total_calls"):
+        return ""
+    total_usd = cost_stats.get("total_usd")
+    main_b = cost_stats.get("main_breakdown") or {}
+    sub_b = cost_stats.get("subagent_breakdown") or {}
+    unpriced = cost_stats.get("unpriced_calls", 0)
+    note = " (estimated, excludes unpriced models)" if (unpriced and total_usd is not None) else " (estimated list price)"
+    head = fmt_usd(total_usd) if total_usd is not None else "Unknown"
+    lines = [f"\nEstimated API cost · {head}{note}\n"]
+    if cost_stats.get("priced_calls"):
+        in_usd = main_b.get("input_usd", 0.0) + sub_b.get("input_usd", 0.0)
+        cache_usd = main_b.get("cache_read_usd", 0.0) + sub_b.get("cache_read_usd", 0.0)
+        out_usd = main_b.get("output_usd", 0.0) + sub_b.get("output_usd", 0.0)
+        lines.append(f" └ Breakdown: input {fmt_usd(in_usd)} · cache {fmt_usd(cache_usd)} · output {fmt_usd(out_usd)}\n")
+        if sub_b.get("calls"):
+            lines.append(
+                f" └ Scope: main {fmt_usd(cost_stats.get('main_usd'))} ({main_b.get('calls', 0)} calls)"
+                f" · subagents ({sub_b.get('count', 0)}) {fmt_usd(cost_stats.get('subagent_usd'))} ({sub_b.get('calls', 0)} calls)\n"
+            )
+    if unpriced:
+        models_str = ", ".join(cost_stats.get("unpriced_models") or [])
+        suffix = f" ({models_str})" if models_str else ""
+        lines.append(f" └ Unpriced calls: {unpriced}{suffix}\n")
+    return "".join(lines)
+
+
+def render(
+    st: dict,
+    model: str,
+    system_files: list[tuple[str, int]],
+    term_width: int,
+    color: bool,
+    cost_stats: dict | None = None,
+) -> str:
     stats = render_stats(st, model)
     grid_width = max(20, (2 * term_width) // 5)
     if term_width >= 70 and term_width - grid_width - 6 >= 40:
@@ -733,6 +823,9 @@ def render(st: dict, model: str, system_files: list[tuple[str, int]], term_width
         body = stats + "\n" + "\n".join(grid) + "\n"
 
     parts = ["└ Context Usage\n", "\n", body]
+    cost_block = render_cost(cost_stats)
+    if cost_block:
+        parts.append(cost_block)
     ck = render_checkpoints(st)
     if ck:
         parts += ["\n", ck]
@@ -906,6 +999,17 @@ def _extract_conversation_id(text: str) -> str:
     return m_cid.group(1) if m_cid else ""
 
 
+def _subagent_conv_id_from_step(step: Step) -> str:
+    tc = step.md.msg(4)
+    tool_name = tc.str(2) if tc is not None else ""
+    if step.type != 127 and tool_name != "invoke_subagent":
+        return ""
+    gen_step = step.pb.msg(STEP_GENERIC) or step.generic_pb
+    res = gen_step.msg(2) if gen_step is not None else None
+    res_text = res.str(1) if res is not None else ""
+    return _extract_conversation_id(res_text)
+
+
 def extract_background_tasks(steps: list[Step], db_path: Path | None = None) -> list[dict]:
     """Extract background tasks (commands, timers) and subagents from steps."""
     killed_subagents: dict[str, int] = {}
@@ -975,10 +1079,7 @@ def extract_background_tasks(steps: list[Step], db_path: Path | None = None) -> 
             type_name = args.get("TypeName") if isinstance(args.get("TypeName"), str) else ""
             prompt = _clip_text(args.get("Prompt"), 32768) if isinstance(args.get("Prompt"), str) else ""
 
-            gen_step = step.pb.msg(STEP_GENERIC) or step.generic_pb
-            res = gen_step.msg(2) if gen_step is not None else None
-            res_text = res.str(1) if res is not None else ""
-            sub_conv_id = _extract_conversation_id(res_text)
+            sub_conv_id = _subagent_conv_id_from_step(step)
 
             if step.status == 2:
                 status = "running"
@@ -1105,6 +1206,168 @@ def collect_output_stats(gens: list[Msg]) -> dict:
     }
 
 
+# --- model usage & API cost estimation ---------------------------------------
+
+# Public API list pricing in USD per 1,000,000 tokens.
+# Sources:
+#   - Google Gemini Developer API: https://ai.google.dev/gemini-api/docs/pricing
+#   - Anthropic Claude API: https://platform.claude.com/docs/en/about-claude/pricing
+# Each model maps to schedule tuples (effective_from_date_or_None, prompt_tiers)
+# ordered descending by effective_from, with prompt_tiers ordered ascending by
+# max_prompt_tokens (None = unbounded).
+MODEL_PRICING: dict[str, tuple[tuple[date | None, tuple[tuple[int | None, dict[str, float | None]], ...]], ...]] = {
+    "gemini-4-carbon": (
+        (date(2026, 12, 1), ((None, {"input": 4.00, "cache_read": 0.20, "output": 20.00}),)),
+        (None, ((None, {"input": 2.00, "cache_read": 0.10, "output": 10.00}),)),
+    ),
+    "gemini-4-argon": (
+        (date(2026, 12, 1), ((None, {"input": 4.00, "cache_read": 0.20, "output": 20.00}),)),
+        (None, ((None, {"input": 2.00, "cache_read": 0.10, "output": 10.00}),)),
+    ),
+    "gemini-4-neon": (
+        (None, ((None, {"input": 3.00, "cache_read": 0.15, "output": 15.00}),)),
+    ),
+    "gemini-4-hydrogen": (
+        (None, ((None, {"input": 1.50, "cache_read": 0.075, "output": 7.50}),)),
+    ),
+    "gemini-3.8-flash": (
+        (date(2027, 1, 1), ((None, {"input": 1.50, "cache_read": 0.15, "output": 7.50}),)),
+        (None, ((None, {"input": 0.75, "cache_read": 0.075, "output": 3.75}),)),
+    ),
+    "gemini-3.6-flash": (
+        (date(2027, 1, 1), ((None, {"input": 1.50, "cache_read": 0.15, "output": 7.50}),)),
+        (None, ((None, {"input": 0.75, "cache_read": 0.075, "output": 3.75}),)),
+    ),
+    "gemini-3.5-flash-lite": (
+        (None, ((None, {"input": 0.30, "cache_read": 0.03, "output": 2.50}),)),
+    ),
+    "gemini-3.1-flash-lite": (
+        (None, ((None, {"input": 0.25, "cache_read": 0.025, "output": 1.50}),)),
+    ),
+    "gemini-3.1-pro": (
+        (
+            None,
+            (
+                (200_000, {"input": 2.00, "cache_read": 0.20, "output": 12.00}),
+                (None, {"input": 4.00, "cache_read": 0.40, "output": 18.00}),
+            ),
+        ),
+    ),
+    "gemini-3-flash": (
+        (None, ((None, {"input": 0.50, "cache_read": 0.05, "output": 3.00}),)),
+    ),
+    "gemini-2.5-pro": (
+        # Effective Dec 1, 2026, Gemini 2.5 Pro routes to Gemini 3.8 Flash and bills at its rates.
+        (date(2027, 1, 1), ((None, {"input": 1.50, "cache_read": 0.15, "output": 7.50}),)),
+        (date(2026, 12, 1), ((None, {"input": 0.75, "cache_read": 0.075, "output": 3.75}),)),
+        (
+            None,
+            (
+                (200_000, {"input": 1.25, "cache_read": 0.125, "output": 10.00}),
+                (None, {"input": 2.50, "cache_read": 0.25, "output": 15.00}),
+            ),
+        ),
+    ),
+    "gemini-2.5-flash": (
+        (None, ((None, {"input": 0.30, "cache_read": 0.03, "output": 2.50}),)),
+    ),
+    "gemini-2.5-flash-lite": (
+        (None, ((None, {"input": 0.10, "cache_read": 0.01, "output": 0.40}),)),
+    ),
+    "claude-opus-5-5": (
+        (None, ((None, {"input": 4.00, "cache_read": 0.20, "output": 20.00}),)),
+    ),
+    "claude-sonnet-5-5": (
+        (None, ((None, {"input": 2.00, "cache_read": 0.10, "output": 10.00}),)),
+    ),
+    "claude-opus-5": (
+        (None, ((None, {"input": 5.00, "cache_read": 0.50, "output": 25.00}),)),
+    ),
+    "claude-opus-4-8": (
+        (None, ((None, {"input": 5.00, "cache_read": 0.50, "output": 25.00}),)),
+    ),
+    "claude-opus-4-7": (
+        (None, ((None, {"input": 5.00, "cache_read": 0.50, "output": 25.00}),)),
+    ),
+    "claude-opus-4-6": (
+        (None, ((None, {"input": 5.00, "cache_read": 0.50, "output": 25.00}),)),
+    ),
+    "claude-opus-4-5": (
+        (None, ((None, {"input": 5.00, "cache_read": 0.50, "output": 25.00}),)),
+    ),
+    "claude-sonnet-5": (
+        (None, ((None, {"input": 2.00, "cache_read": 0.20, "output": 10.00}),)),
+    ),
+    "claude-sonnet-4-6": (
+        (None, ((None, {"input": 3.00, "cache_read": 0.30, "output": 15.00}),)),
+    ),
+    "claude-sonnet-4-5": (
+        (None, ((None, {"input": 3.00, "cache_read": 0.30, "output": 15.00}),)),
+    ),
+    "claude-haiku-5-5": (
+        (
+            None,
+            (
+                (100_000, {"input": 0.10, "cache_read": 0.01, "output": 0.50}),
+                (None, {"input": 0.50, "cache_read": 0.05, "output": 2.50}),
+            ),
+        ),
+    ),
+    "claude-haiku-4-5": (
+        (None, ((None, {"input": 1.00, "cache_read": 0.10, "output": 5.00}),)),
+    ),
+}
+
+PRICING_SLUG_ALIASES = {
+    "gemini-pro-orchestrator": "gemini-4-carbon",
+    "gemini-pro-orchestrator-carbon": "gemini-4-carbon",
+    "gemini-pro-orchestrator-neon": "gemini-4-neon",
+    "gemini-pro-orchestrator-argon": "gemini-4-argon",
+    "gemini-flash-worker-agy": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-sonar": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-orchestrator": "gemini-4-hydrogen",
+    "gemini-2.5-flash-thinking": "gemini-2.5-flash",
+    "gemini-3.1-pro-preview": "gemini-3.1-pro",
+    "gemini-3.1-pro-preview-customtools": "gemini-3.1-pro",
+    "gemini-3.1-pro-customtools": "gemini-3.1-pro",
+    "gemini-3-flash-preview": "gemini-3-flash",
+}
+
+PRICING_DISPLAY_ALIASES = {
+    "orchestrator carbon": "gemini-4-carbon",
+    "gemini 4 carbon": "gemini-4-carbon",
+    "orchestrator argon": "gemini-4-argon",
+    "gemini 4 argon": "gemini-4-argon",
+    "orchestrator neon": "gemini-4-neon",
+    "gemini 4 neon": "gemini-4-neon",
+    "gemini 4 hydrogen": "gemini-4-hydrogen",
+    "gemini 4 hydrogen orchestrator": "gemini-4-hydrogen",
+    "gemini 3.8 flash": "gemini-3.8-flash",
+    "gemini 3.6 flash": "gemini-3.6-flash",
+    "gemini 3.5 flash lite": "gemini-3.5-flash-lite",
+    "gemini 3.1 flash lite": "gemini-3.1-flash-lite",
+    "gemini 3.1 pro": "gemini-3.1-pro",
+    "gemini 3.1 pro preview": "gemini-3.1-pro",
+    "gemini 3 flash": "gemini-3-flash",
+    "gemini 3 flash preview": "gemini-3-flash",
+    "gemini 2.5 pro": "gemini-2.5-pro",
+    "gemini 2.5 flash": "gemini-2.5-flash",
+    "gemini 2.5 flash lite": "gemini-2.5-flash-lite",
+    "claude opus 5.5": "claude-opus-5-5",
+    "claude sonnet 5.5": "claude-sonnet-5-5",
+    "claude opus 5": "claude-opus-5",
+    "claude opus 4.8": "claude-opus-4-8",
+    "claude opus 4.7": "claude-opus-4-7",
+    "claude opus 4.6": "claude-opus-4-6",
+    "claude opus 4.5": "claude-opus-4-5",
+    "claude sonnet 5": "claude-sonnet-5",
+    "claude sonnet 4.6": "claude-sonnet-4-6",
+    "claude sonnet 4.5": "claude-sonnet-4-5",
+    "claude haiku 5.5": "claude-haiku-5-5",
+    "claude haiku 4.5": "claude-haiku-4-5",
+}
+
+
 def base_model_id(slug: str) -> str:
     """Normalize model slug to base model family ID (strip effort & -tiered alias)."""
     parts = [p for p in slug.strip().split("-") if p]
@@ -1113,6 +1376,197 @@ def base_model_id(slug: str) -> str:
     if len(parts) > 1 and parts[-1].lower() == "tiered":
         parts.pop()
     return "-".join(parts)
+
+
+def _normalize_pricing_slug(slug: str) -> str:
+    s = slug.strip().lower()
+    if not s:
+        return ""
+    if s in PRICING_SLUG_ALIASES:
+        return PRICING_SLUG_ALIASES[s]
+    if s in MODEL_PRICING:
+        return s
+    parts = [p for p in s.split("-") if p]
+    while len(parts) > 1 and parts[-1] in (*EFFORT_LEVELS, "tiered", "thinking", "preview", "customtools"):
+        candidate = "-".join(parts)
+        if candidate in PRICING_SLUG_ALIASES:
+            return PRICING_SLUG_ALIASES[candidate]
+        if candidate in MODEL_PRICING:
+            return candidate
+        parts.pop()
+    joined = "-".join(parts)
+    if joined in PRICING_SLUG_ALIASES:
+        return PRICING_SLUG_ALIASES[joined]
+    if joined in MODEL_PRICING:
+        return joined
+    return ""
+
+
+def _normalize_pricing_display(name: str) -> str:
+    if not name:
+        return ""
+    base = re.sub(r"\s*\((orchestrator)\)\s*$", "", split_model_effort(name)[0], flags=re.IGNORECASE)
+    norm = re.sub(r"[^a-z0-9.]+", " ", base.lower()).strip()
+    if norm in PRICING_DISPLAY_ALIASES:
+        return PRICING_DISPLAY_ALIASES[norm]
+    if norm.startswith("orchestrator ") and norm[len("orchestrator "):] in ("carbon", "argon", "neon"):
+        return PRICING_DISPLAY_ALIASES[norm]
+    return ""
+
+
+def resolve_pricing_model_key(slugs: tuple[str, ...], display_names: tuple[str, ...]) -> str:
+    for slug in slugs:
+        key = _normalize_pricing_slug(slug)
+        if key:
+            return key
+    for name in display_names:
+        key = _normalize_pricing_display(name)
+        if key:
+            return key
+    return ""
+
+
+def lookup_model_rates(pricing_key: str, prompt_tokens: int, on_date: date) -> dict[str, float | None] | None:
+    schedules = MODEL_PRICING.get(pricing_key)
+    if not schedules:
+        return None
+    for effective_from, tiers in schedules:
+        if effective_from is None or on_date >= effective_from:
+            for max_prompt, rates in tiers:
+                if max_prompt is None or prompt_tokens <= max_prompt:
+                    return rates
+    return None
+
+
+def estimate_call_cost(
+    pricing_key: str,
+    inp: int,
+    cache_read: int,
+    out: int,
+    on_date: date,
+) -> dict[str, float] | None:
+    if not pricing_key:
+        return None
+    rates = lookup_model_rates(pricing_key, inp + cache_read, on_date)
+    if rates is None:
+        return None
+    cache_rate = rates["cache_read"]
+    if cache_read > 0 and cache_rate is None:
+        return None
+    in_usd = (inp / 1_000_000.0) * float(rates["input"])
+    cache_usd = ((cache_read / 1_000_000.0) * float(cache_rate)) if cache_read > 0 and cache_rate is not None else 0.0
+    out_usd = (out / 1_000_000.0) * float(rates["output"])
+    saved_usd = (
+        (cache_read / 1_000_000.0) * max(0.0, float(rates["input"]) - float(cache_rate))
+        if cache_read > 0 and cache_rate is not None
+        else 0.0
+    )
+    return {
+        "input_usd": in_usd,
+        "cache_read_usd": cache_usd,
+        "output_usd": out_usd,
+        "total_usd": in_usd + cache_usd + out_usd,
+        "cache_saved_usd": saved_usd,
+    }
+
+
+def _step_dates_from_steps(steps: list[Step]) -> dict[int, date]:
+    dates: dict[int, date] = {}
+    for step in steps:
+        ts = step.md.msg(1)
+        sec = ts.int(1) if ts is not None else 0
+        if sec > 0:
+            try:
+                dates[step.idx] = datetime.fromtimestamp(sec).date()
+            except (OverflowError, OSError, ValueError):
+                pass
+    return dates
+
+
+def _gen_call_date(gen: Msg, step_dates: dict[int, date] | None, fallback_date: date) -> date:
+    if step_dates:
+        chat = gen.msg(1)
+        if chat is not None:
+            for kv in chat.msgs(20):
+                if kv.str(1) == "last_step_index":
+                    raw = kv.str(2).strip()
+                    if raw.isdigit():
+                        d = step_dates.get(int(raw))
+                        if d is not None:
+                            return d
+                    break
+    return fallback_date
+
+
+def _new_cost_bucket() -> dict:
+    return {
+        "calls": 0,
+        "priced_calls": 0,
+        "unpriced_calls": 0,
+        "input_tokens": 0,
+        "cache_read_tokens": 0,
+        "output_tokens": 0,
+        "input_usd": 0.0,
+        "cache_read_usd": 0.0,
+        "output_usd": 0.0,
+        "total_usd": 0.0,
+        "cache_saved_usd": 0.0,
+    }
+
+
+def _evaluate_gens(
+    gens: list[Msg],
+    catalog: dict | None = None,
+    step_dates: dict[int, date] | None = None,
+    override_date: date | None = None,
+) -> tuple[dict, list[tuple[Msg, int, int, int, int, str, str, str, str, dict[str, float] | None]], dict[str, int]]:
+    latest_step_date = max(step_dates.values()) if step_dates else None
+    fallback_date = override_date or latest_step_date or date.today()
+    bucket = _new_cost_bucket()
+    unpriced_models: dict[str, int] = {}
+    evaluated: list[tuple[Msg, int, int, int, int, str, str, str, str, dict[str, float] | None]] = []
+
+    for g in gens:
+        chat = g.msg(1)
+        u = chat.msg(4) if chat is not None else None
+        if u is None:
+            continue
+        inp = u.int(2)
+        cache_read = u.int(5)
+        out = u.int(3)
+        thinking = u.int(9)
+        if inp + cache_read + out <= 0:
+            continue
+
+        mid = model_id(g)
+        resp_mid = chat.str(19) if chat is not None else ""
+        raw_cat = (catalog or {}).get(mid)
+        catalog_display = _safe_str(raw_cat.get("displayName")) if isinstance(raw_cat, dict) else ""
+        chat_display = chat.str(21) if chat is not None else ""
+        display = split_model_effort(catalog_display or model_name(g))[0]
+
+        call_date = override_date if override_date is not None else _gen_call_date(g, step_dates, fallback_date)
+        pricing_key = resolve_pricing_model_key((mid, resp_mid), (catalog_display, chat_display, display))
+        call_cost = estimate_call_cost(pricing_key, inp, cache_read, out, call_date)
+
+        bucket["calls"] += 1
+        bucket["input_tokens"] += inp
+        bucket["cache_read_tokens"] += cache_read
+        bucket["output_tokens"] += out
+        if call_cost is not None:
+            bucket["priced_calls"] += 1
+            bucket["input_usd"] += call_cost["input_usd"]
+            bucket["cache_read_usd"] += call_cost["cache_read_usd"]
+            bucket["output_usd"] += call_cost["output_usd"]
+            bucket["total_usd"] += call_cost["total_usd"]
+            bucket["cache_saved_usd"] += call_cost["cache_saved_usd"]
+        else:
+            bucket["unpriced_calls"] += 1
+            unpriced_models[display] = unpriced_models.get(display, 0) + 1
+
+        evaluated.append((g, inp, cache_read, out, thinking, mid, resp_mid, catalog_display, chat_display, call_cost))
+
+    return bucket, evaluated, unpriced_models
 
 
 def slug_effort_label(slug: str) -> str:
@@ -1144,8 +1598,8 @@ def split_model_effort(name: str) -> tuple[str, str]:
     return text, ""
 
 
-def collect_model_usage(gens: list[Msg], catalog: dict | None = None) -> list[dict]:
-    """Aggregate per-model call counts and token usage across gen_metadata, grouped by base model."""
+def _model_usage_from_evaluated(evaluated: list, catalog: dict | None = None) -> list[dict]:
+    """Aggregate per-model call counts, token usage, and estimated USD across evaluated gens."""
     id_buckets: dict[str, dict] = {}
     name_buckets: dict[str, dict] = {}
 
@@ -1159,11 +1613,25 @@ def collect_model_usage(gens: list[Msg], catalog: dict | None = None) -> list[di
             "output_tokens": 0,
             "thinking_tokens": 0,
             "efforts": {},
+            "priced_calls": 0,
+            "unpriced_calls": 0,
+            "input_cost_usd": 0.0,
+            "cache_read_cost_usd": 0.0,
+            "output_cost_usd": 0.0,
+            "total_cost_usd": 0.0,
             "_aliases": set(),
             "_label_votes": {},
         }
 
-    def _add_stats(entry: dict, inp: int, cache_read: int, out: int, thinking: int, effort: str):
+    def _add_stats(
+        entry: dict,
+        inp: int,
+        cache_read: int,
+        out: int,
+        thinking: int,
+        effort: str,
+        call_cost: dict[str, float] | None,
+    ):
         entry["calls"] += 1
         entry["input_tokens"] += inp
         entry["cache_read_tokens"] += cache_read
@@ -1171,6 +1639,14 @@ def collect_model_usage(gens: list[Msg], catalog: dict | None = None) -> list[di
         entry["thinking_tokens"] += thinking
         if effort:
             entry["efforts"][effort] = entry["efforts"].get(effort, 0) + 1
+        if call_cost is not None:
+            entry["priced_calls"] += 1
+            entry["input_cost_usd"] += call_cost["input_usd"]
+            entry["cache_read_cost_usd"] += call_cost["cache_read_usd"]
+            entry["output_cost_usd"] += call_cost["output_usd"]
+            entry["total_cost_usd"] += call_cost["total_usd"]
+        else:
+            entry["unpriced_calls"] += 1
 
     catalog_name_to_ids: dict[str, set[str]] = {}
     for slug, cat_val in (catalog or {}).items():
@@ -1183,25 +1659,10 @@ def collect_model_usage(gens: list[Msg], catalog: dict | None = None) -> list[di
             if cat_base and canon_slug:
                 catalog_name_to_ids.setdefault(cat_base, set()).add(canon_slug)
 
-    for g in gens:
+    for g, inp, cache_read, out, thinking, mid, resp_mid, catalog_display, chat_display, call_cost in evaluated:
         chat = g.msg(1)
-        u = chat.msg(4) if chat is not None else None
-        if u is None:
-            continue
-        inp = u.int(2)
-        cache_read = u.int(5)
-        out = u.int(3)
-        thinking = u.int(9)
-        if inp + cache_read + out <= 0:
-            continue
-
-        mid = model_id(g)
-        resp_mid = chat.str(19) if chat is not None else ""
         canon_id = base_model_id(mid) if mid else (base_model_id(resp_mid) if resp_mid and "-" in resp_mid else "")
 
-        raw_cat = (catalog or {}).get(mid)
-        catalog_display = _safe_str(raw_cat.get("displayName")) if isinstance(raw_cat, dict) else ""
-        chat_display = chat.str(21) if chat is not None else ""
         raw_display = catalog_display or model_name(g)
         display, disp_effort = split_model_effort(raw_display)
         slug_effort = (
@@ -1227,14 +1688,14 @@ def collect_model_usage(gens: list[Msg], catalog: dict | None = None) -> list[di
             vote_label = base_catalog or base_chat or id_default
             if vote_label:
                 entry["_label_votes"][vote_label] = entry["_label_votes"].get(vote_label, 0) + 1
-            _add_stats(entry, inp, cache_read, out, thinking, effort)
+            _add_stats(entry, inp, cache_read, out, thinking, effort, call_cost)
         else:
             key = display.lower()
             entry = name_buckets.get(key)
             if entry is None:
                 entry = _new_bucket(display, "")
                 name_buckets[key] = entry
-            _add_stats(entry, inp, cache_read, out, thinking, effort)
+            _add_stats(entry, inp, cache_read, out, thinking, effort, call_cost)
 
     # Merge historical no-ID buckets only when unambiguous across BOTH observed session IDs and the catalog
     unmatched_names: list[dict] = []
@@ -1248,6 +1709,12 @@ def collect_model_usage(gens: list[Msg], catalog: dict | None = None) -> list[di
             target["cache_read_tokens"] += n_entry["cache_read_tokens"]
             target["output_tokens"] += n_entry["output_tokens"]
             target["thinking_tokens"] += n_entry["thinking_tokens"]
+            target["priced_calls"] += n_entry["priced_calls"]
+            target["unpriced_calls"] += n_entry["unpriced_calls"]
+            target["input_cost_usd"] += n_entry["input_cost_usd"]
+            target["cache_read_cost_usd"] += n_entry["cache_read_cost_usd"]
+            target["output_cost_usd"] += n_entry["output_cost_usd"]
+            target["total_cost_usd"] += n_entry["total_cost_usd"]
             for eff, cnt in n_entry["efforts"].items():
                 target["efforts"][eff] = target["efforts"].get(eff, 0) + cnt
             lbl = n_entry["model"]
@@ -1267,6 +1734,7 @@ def collect_model_usage(gens: list[Msg], catalog: dict | None = None) -> list[di
         total_in = entry["input_tokens"] + entry["cache_read_tokens"]
         total = total_in + entry["output_tokens"]
         efforts = dict(sorted(entry["efforts"].items(), key=lambda kv: kv[1], reverse=True))
+        has_cost = entry["priced_calls"] > 0
         results.append({
             "model": entry["model"],
             "model_id": entry["model_id"],
@@ -1280,6 +1748,11 @@ def collect_model_usage(gens: list[Msg], catalog: dict | None = None) -> list[di
             "total_tokens": total,
             "cache_hit_rate": round(entry["cache_read_tokens"] / total_in * 100.0, 1) if total_in > 0 else None,
             "share_pct": 0.0,
+            "estimated_cost_usd": round(entry["total_cost_usd"], 6) if has_cost else None,
+            "input_cost_usd": round(entry["input_cost_usd"], 6) if has_cost else None,
+            "cache_read_cost_usd": round(entry["cache_read_cost_usd"], 6) if has_cost else None,
+            "output_cost_usd": round(entry["output_cost_usd"], 6) if has_cost else None,
+            "unpriced_calls": entry["unpriced_calls"],
         })
     results.sort(key=lambda m: (m["total_tokens"], m["calls"]), reverse=True)
     grand_total = sum(m["total_tokens"] for m in results)
@@ -1289,10 +1762,224 @@ def collect_model_usage(gens: list[Msg], catalog: dict | None = None) -> list[di
     return results
 
 
+def collect_model_usage(
+    gens: list[Msg],
+    catalog: dict | None = None,
+    step_dates: dict[int, date] | None = None,
+    override_date: date | None = None,
+) -> list[dict]:
+    """Aggregate per-model call counts, token usage, and estimated USD across gen_metadata."""
+    _, evaluated, _ = _evaluate_gens(gens, catalog=catalog, step_dates=step_dates, override_date=override_date)
+    return _model_usage_from_evaluated(evaluated, catalog=catalog)
+
+
+def _read_subagent_cost_rows(sub_db: Path) -> tuple[list[Step], list[Msg]]:
+    def _read(conn: sqlite3.Connection):
+        conn.execute("BEGIN")
+        step_cols = {r[1] for r in conn.execute("PRAGMA table_info(steps)").fetchall()}
+        sub_step_rows = []
+        if step_cols:
+            idx_col = "idx" if "idx" in step_cols else "rowid"
+            st_col = "step_type" if "step_type" in step_cols else "0"
+            status_col = "status" if "status" in step_cols else "0"
+            md_col = "metadata" if "metadata" in step_cols else "NULL"
+            sp_col = "step_payload" if "step_payload" in step_cols else "NULL"
+            if "step_type" in step_cols:
+                sub_step_rows = conn.execute(
+                    f"SELECT {idx_col}, {st_col}, {status_col}, {md_col}, "
+                    f"CASE WHEN {st_col} IN (127, 132) THEN {sp_col} ELSE NULL END "
+                    f"FROM steps ORDER BY 1"
+                ).fetchall()
+            else:
+                sub_step_rows = conn.execute(
+                    f"SELECT {idx_col}, {st_col}, {status_col}, {md_col}, {sp_col} FROM steps ORDER BY 1"
+                ).fetchall()
+        has_gen = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='gen_metadata'"
+        ).fetchone()
+        gen_rows = []
+        if has_gen:
+            gen_cols = {r[1] for r in conn.execute("PRAGMA table_info(gen_metadata)").fetchall()}
+            if "data" in gen_cols:
+                order_col = "idx" if "idx" in gen_cols else "rowid"
+                gen_rows = conn.execute(f"SELECT data FROM gen_metadata ORDER BY {order_col}").fetchall()
+        conn.rollback()
+        return sub_step_rows, gen_rows
+
+    sub_step_rows, gen_rows = _query_ro_db(sub_db, _read)
+    sub_steps = [
+        Step(pos, r[4] or b"", r[1], r[2], r[3], idx=r[0])
+        for pos, r in enumerate(sub_step_rows)
+    ]
+    sub_gens = [Msg(r[0]) for r in gen_rows]
+    return sub_steps, sub_gens
+
+
+def _extract_subagent_ids_from_steps(steps: list[Step]) -> list[str]:
+    ids: list[str] = []
+    for step in steps:
+        cid = _subagent_conv_id_from_step(step)
+        if cid and re.fullmatch(r"[0-9a-fA-F-]+", cid):
+            ids.append(cid)
+    return ids
+
+
+def _bucket_summary(bucket: dict, count: int | None = None) -> dict:
+    has_cost = bucket["priced_calls"] > 0
+    out = {
+        "calls": bucket["calls"],
+        "priced_calls": bucket["priced_calls"],
+        "unpriced_calls": bucket["unpriced_calls"],
+        "input_tokens": bucket["input_tokens"],
+        "cache_read_tokens": bucket["cache_read_tokens"],
+        "output_tokens": bucket["output_tokens"],
+        "input_usd": round(bucket["input_usd"], 6) if has_cost else 0.0,
+        "cache_read_usd": round(bucket["cache_read_usd"], 6) if has_cost else 0.0,
+        "output_usd": round(bucket["output_usd"], 6) if has_cost else 0.0,
+        "total_usd": round(bucket["total_usd"], 6) if has_cost else None,
+        "cache_saved_usd": round(bucket["cache_saved_usd"], 6) if has_cost else 0.0,
+    }
+    if count is not None:
+        out["count"] = count
+    return out
+
+
+def _summarize_cost_by_model(
+    evaluated_rows: list,
+    scope_total_usd: float | None,
+    catalog: dict | None,
+) -> list[dict]:
+    if not evaluated_rows:
+        return []
+    priced_total = float(scope_total_usd) if scope_total_usd is not None else 0.0
+    out: list[dict] = []
+    for m_item in _model_usage_from_evaluated(evaluated_rows, catalog=catalog):
+        m_usd = m_item.get("estimated_cost_usd")
+        out.append({
+            "model": m_item["model"],
+            "model_id": m_item["model_id"],
+            "calls": m_item["calls"],
+            "total_tokens": m_item["total_tokens"],
+            "estimated_cost_usd": m_usd,
+            "input_cost_usd": m_item["input_cost_usd"],
+            "cache_read_cost_usd": m_item["cache_read_cost_usd"],
+            "output_cost_usd": m_item["output_cost_usd"],
+            "unpriced_calls": m_item["unpriced_calls"],
+            "share_pct": round((m_usd / priced_total * 100.0), 1) if (m_usd is not None and priced_total > 0) else 0.0,
+        })
+    out.sort(
+        key=lambda x: (
+            x["estimated_cost_usd"] if x["estimated_cost_usd"] is not None else -1.0,
+            x["total_tokens"],
+            x["calls"],
+        ),
+        reverse=True,
+    )
+    return out
+
+
+def collect_session_cost(
+    db_path: Path,
+    main_steps: list[Step],
+    main_gens: list[Msg],
+    main_bucket: dict,
+    unpriced_models: dict[str, int],
+    catalog: dict | None = None,
+    override_date: date | None = None,
+    main_evaluated: list | None = None,
+) -> dict:
+    """Aggregate public API equivalent USD estimate across the main conversation and descendant subagents."""
+    sub_bucket = _new_cost_bucket()
+    merged_unpriced = dict(unpriced_models)
+    sub_ids_seen: set[str] = {db_path.stem.lower()}
+    sub_db_ids: list[str] = []
+    sub_evaluated: list = []
+    sub_with_calls = 0
+
+    max_depth = 4
+    max_sub_dbs = 200
+    queue: deque[tuple[str, int]] = deque()
+    for cid in _extract_subagent_ids_from_steps(main_steps):
+        if cid.lower() not in sub_ids_seen:
+            sub_ids_seen.add(cid.lower())
+            queue.append((cid, 1))
+
+    while queue and len(sub_db_ids) < max_sub_dbs:
+        cid, depth = queue.popleft()
+        sub_db = db_path.parent / f"{cid}.db"
+        if not sub_db.is_file():
+            continue
+        sub_db_ids.append(cid)
+        try:
+            sub_steps, sub_gens = _read_subagent_cost_rows(sub_db)
+        except sqlite3.Error:
+            continue
+
+        if depth < max_depth:
+            for child_cid in _extract_subagent_ids_from_steps(sub_steps):
+                if child_cid.lower() not in sub_ids_seen:
+                    sub_ids_seen.add(child_cid.lower())
+                    queue.append((child_cid, depth + 1))
+
+        s_dates = _step_dates_from_steps(sub_steps)
+        child_bucket, child_eval, child_unpriced = _evaluate_gens(
+            sub_gens,
+            catalog=catalog,
+            step_dates=s_dates,
+            override_date=override_date,
+        )
+        sub_evaluated.extend(child_eval)
+        if child_bucket["calls"] > 0:
+            sub_with_calls += 1
+        for k in (
+            "calls", "priced_calls", "unpriced_calls",
+            "input_tokens", "cache_read_tokens", "output_tokens",
+            "input_usd", "cache_read_usd", "output_usd", "total_usd", "cache_saved_usd",
+        ):
+            sub_bucket[k] += child_bucket[k]
+        for mname, cnt in child_unpriced.items():
+            merged_unpriced[mname] = merged_unpriced.get(mname, 0) + cnt
+
+    total_calls = main_bucket["calls"] + sub_bucket["calls"]
+    priced_calls = main_bucket["priced_calls"] + sub_bucket["priced_calls"]
+    unpriced_calls = main_bucket["unpriced_calls"] + sub_bucket["unpriced_calls"]
+    total_usd = round(main_bucket["total_usd"] + sub_bucket["total_usd"], 6) if priced_calls > 0 else None
+    main_usd = round(main_bucket["total_usd"], 6) if main_bucket["priced_calls"] > 0 else (0.0 if priced_calls > 0 and main_bucket["calls"] == 0 else None)
+    sub_usd = round(sub_bucket["total_usd"], 6) if sub_bucket["priced_calls"] > 0 else (0.0 if sub_bucket["calls"] == 0 else None)
+    cache_saved_usd = round(main_bucket["cache_saved_usd"] + sub_bucket["cache_saved_usd"], 6) if priced_calls > 0 else 0.0
+    unpriced_list = [k for k, _ in sorted(merged_unpriced.items(), key=lambda kv: kv[1], reverse=True)]
+
+    all_evaluated = list(main_evaluated or []) + sub_evaluated
+    by_model = _summarize_cost_by_model(all_evaluated, total_usd, catalog)
+    subagent_by_model = _summarize_cost_by_model(sub_evaluated, sub_usd, catalog)
+
+    return {
+        "estimated": True,
+        "currency": "USD",
+        "total_usd": total_usd,
+        "main_usd": main_usd,
+        "subagent_usd": sub_usd,
+        "cache_saved_usd": cache_saved_usd,
+        "total_calls": total_calls,
+        "priced_calls": priced_calls,
+        "unpriced_calls": unpriced_calls,
+        "unpriced_models": unpriced_list,
+        "by_model": by_model,
+        "subagent_by_model": subagent_by_model,
+        "main_breakdown": _bucket_summary(main_bucket),
+        "subagent_breakdown": _bucket_summary(sub_bucket, count=sub_with_calls),
+        "subagent_conversation_ids": sub_db_ids,
+    }
+
+
 # --- main --------------------------------------------------------------------
 
 
-def load_db(db_path: Path, catalog: dict | None = None) -> tuple[list[Step], Msg | None, dict, dict, list[dict]]:
+def _load_db_full(
+    db_path: Path,
+    catalog: dict | None = None,
+    override_date: date | None = None,
+) -> tuple[list[Step], Msg | None, dict, dict, list[dict], dict]:
     def _read(conn: sqlite3.Connection):
         conn.execute("BEGIN")
         step_cols = [r[1] for r in conn.execute("PRAGMA table_info(steps)").fetchall()]
@@ -1332,13 +2019,37 @@ def load_db(db_path: Path, catalog: dict | None = None) -> tuple[list[Step], Msg
         for pos, r in enumerate(rows)
     ]
     gens = [Msg(r[0]) for r in gen_rows]
+    step_dates = _step_dates_from_steps(steps)
+    main_bucket, evaluated, unpriced_models = _evaluate_gens(
+        gens,
+        catalog=catalog,
+        step_dates=step_dates,
+        override_date=override_date,
+    )
+    model_usage = _model_usage_from_evaluated(evaluated, catalog=catalog)
+    cost_stats = collect_session_cost(
+        db_path,
+        steps,
+        gens,
+        main_bucket,
+        unpriced_models,
+        catalog=catalog,
+        override_date=override_date,
+        main_evaluated=evaluated,
+    )
     return (
         steps,
         (gens[-1] if gens else None),
         collect_cache_stats(gens),
         collect_output_stats(gens),
-        collect_model_usage(gens, catalog=catalog),
+        model_usage,
+        cost_stats,
     )
+
+
+def load_db(db_path: Path, catalog: dict | None = None) -> tuple[list[Step], Msg | None, dict, dict, list[dict]]:
+    steps, latest_gen, cache_stats, output_stats, model_usage, _ = _load_db_full(db_path, catalog=catalog)
+    return steps, latest_gen, cache_stats, output_stats, model_usage
 
 
 def load(db_path: Path) -> tuple[list[Step], Msg | None]:
@@ -1430,7 +2141,15 @@ def main():
     parser.add_argument("--json", action="store_true", help="Output JSON data")
     parser.add_argument("--model-catalog", help='JSON file of {"<model id>": {"maxTokens": n, "displayName": "..."}} '
                         "from the app's live model catalog; overrides the built-in limits and labels")
+    parser.add_argument("--price-date", default=None, help="Override pricing date (YYYY-MM-DD) for deterministic estimates")
     args = parser.parse_args()
+
+    override_date: date | None = None
+    if args.price_date:
+        try:
+            override_date = date.fromisoformat(args.price_date)
+        except ValueError as exc:
+            raise SystemExit(f"Invalid --price-date '{args.price_date}' (expected YYYY-MM-DD): {exc}") from exc
 
     if args.db:
         db_path = Path(args.db).expanduser()
@@ -1459,7 +2178,9 @@ def main():
                 catalog = loaded_catalog
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"[status-bar] ignoring invalid model catalog {args.model_catalog}: {exc}", file=sys.stderr)
-    steps, gen, cache_stats, output_stats, model_usage = load_db(db_path, catalog=catalog)
+    steps, gen, cache_stats, output_stats, model_usage, cost_stats = _load_db_full(
+        db_path, catalog=catalog, override_date=override_date
+    )
     raw_cat_entry = catalog.get(model_id(gen))
     catalog_entry = raw_cat_entry if isinstance(raw_cat_entry, dict) else {}
     cat_max = _safe_max_tokens(catalog_entry.get("maxTokens"))
@@ -1475,7 +2196,7 @@ def main():
             "heading": stats_heading(st),
             "grid_segments": grid_segments(st),
             "checkpoint_view": checkpoint_view(st),
-            "text": render(st, model, system_files, args.width, False),
+            "text": render(st, model, system_files, args.width, False, cost_stats=cost_stats),
             "model_id": model_id(gen),
             "request_budget_tokens": request_budget(gen),
             "used_tokens": st["total"],
@@ -1500,10 +2221,11 @@ def main():
             "cache_stats": cache_stats,
             "output_stats": output_stats,
             "model_usage": model_usage,
+            "cost_stats": cost_stats,
         }, indent=2))
         return
 
-    print(render(st, model, system_files, args.width, args.color))
+    print(render(st, model, system_files, args.width, args.color, cost_stats=cost_stats))
 
 
 if __name__ == "__main__":

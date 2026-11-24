@@ -260,6 +260,16 @@ export function collectDependencyStamps(reportData, conversationsDir, tasksDir, 
       if (tasksDir && Number.isInteger(t.step_idx)) addPath(join(tasksDir, `task-${t.step_idx}.log`), false);
     }
   }
+  const extraSubIds = Array.isArray(reportData?.cost_stats?.subagent_conversation_ids)
+    ? reportData.cost_stats.subagent_conversation_ids
+    : [];
+  for (const sid of extraSubIds) {
+    if (typeof sid === 'string' && UUID.test(sid)) {
+      const subDb = join(conversationsDir, `${sid}.db`);
+      addPath(subDb, true);
+      addPath(`${subDb}-wal`, false);
+    }
+  }
   return stamps;
 }
 

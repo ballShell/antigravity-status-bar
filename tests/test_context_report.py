@@ -249,6 +249,32 @@ class ReportTest(unittest.TestCase):
         self.assertFalse(r["compacted"])
         self.assertIn("steps 0–2", self.run_report())
 
+    def test_checkpoint_view_uses_request_label_and_history_items(self):
+        self.db.step(USER_INPUT, metadata=f(1, f(1, 1795262000)), payload_field=P_USER, payload=user_input("first"))
+        self.db.step(
+            CHECKPOINT,
+            metadata=f(1, f(1, 1795262100)),
+            payload_field=P_CHECKPOINT,
+            payload=m(f(1, 0), f(11, 0), f(12, 1), f(30, f(1, "Setup repo")), f(30, f(1, "/compact"))),
+        )
+        self.db.step(
+            CHECKPOINT,
+            metadata=f(1, f(1, 1795262500)),
+            payload_field=P_CHECKPOINT,
+            payload=m(f(1, 1), f(11, 1), f(12, 5), f(30, f(1, "Fix navbar")), f(30, f(1, "/compact"))),
+        )
+        self.db.generation([group(7, 10, ("0: USER_INPUT", 10))], checkpoint_index=1)
+        r = self.report()
+        ck_view = r["checkpoint_view"]
+        self.assertEqual(ck_view["active_number"], 2)
+        self.assertEqual(ck_view["active_text"], "Fix navbar")
+        self.assertEqual(ck_view["historical"], 1)
+        self.assertEqual([it["number"] for it in ck_view["items"]], [2, 1])
+        self.assertEqual([it["text"] for it in ck_view["items"]], ["Fix navbar", "Setup repo"])
+        self.assertEqual(ck_view["items"][0]["active"], True)
+        self.assertEqual(ck_view["items"][1]["active"], False)
+        self.assertEqual(ck_view["items"][1]["created_at"], 1795262100)
+
     def test_checkpoint_buffer_counts_checkpoint_steps(self):
         self.db.step(CHECKPOINT, metadata=tool_call("c" * 80), payload_field=P_CHECKPOINT, payload=f(1, 0))
         self.db.step(PLANNER_RESPONSE, metadata=f(9, usage(0, 5)), payload_field=P_PLANNER, payload=planner("x"))
@@ -892,6 +918,218 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(context_report.fmt_tok(1500), "1.5k")
         self.assertEqual(context_report.fmt_tok(1_000_000), "1M")
         self.assertEqual(context_report.fmt_tok(1_250_000), "1.2M")
+        self.assertEqual(context_report.fmt_usd(None), "-")
+        self.assertEqual(context_report.fmt_usd(0.0), "$0.00")
+        self.assertEqual(context_report.fmt_usd(0.00424), "$0.0042")
+        self.assertEqual(context_report.fmt_usd(0.0456), "$0.046")
+        self.assertEqual(context_report.fmt_usd(3.846), "$3.85")
+
+
+class CostEstimateTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _run_json(self, db_path: Path, *args: str) -> dict:
+        env = dict(os.environ, HOME=str(self.home), USERPROFILE=str(self.home), PYTHONIOENCODING="utf-8")
+        res = subprocess.run(
+            [sys.executable, str(SCRIPT), "--db", str(db_path), "--json", *args],
+            capture_output=True, env=env, text=True, encoding="utf-8", check=True,
+        )
+        return json.loads(res.stdout)
+
+    def _subagent_step(self, db: ConversationDB, cid: str, ts: int | None = None):
+        md_parts = [f(4, m(f(2, "invoke_subagent"), f(3, json.dumps({"Role": "Worker", "TypeName": "self", "Prompt": "work"}))))]
+        if ts is not None:
+            md_parts.insert(0, f(1, f(1, ts)))
+        res = f(1, json.dumps({"conversationId": cid}))
+        db.step(GENERIC, metadata=m(*md_parts), payload_field=140, payload=f(2, res), status=3)
+
+    def test_session_api_cost_and_recursive_subagent_rollup(self):
+        main_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        child_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        grandchild_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        missing_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+
+        main_db_path = self.home / f"{main_id}.db"
+        child_db_path = self.home / f"{child_id}.db"
+        grand_db_path = self.home / f"{grandchild_id}.db"
+
+        # Grandchild: 1M output on Claude Opus 5.5 ($20.00) + circular reference back to main_id
+        grand = ConversationDB(grand_db_path)
+        self._subagent_step(grand, main_id)
+        grand.generation(
+            [group(7, 100, ("0: USER_INPUT", 100))],
+            usage=usage(input_tokens=0, output=1_000_000, cache_read=0),
+            model="claude-opus-5-5-high",
+            display_name="",
+        )
+        grand.close()
+
+        # Child: Gemini 4 Neon (1M new in = $3.00) + spawns grandchild_id
+        child = ConversationDB(child_db_path)
+        self._subagent_step(child, grandchild_id)
+        child.generation(
+            [group(7, 100, ("0: USER_INPUT", 100))],
+            usage=usage(input_tokens=1_000_000, output=0, cache_read=0),
+            model="gemini-4-neon-medium",
+            display_name="",
+        )
+        child.close()
+
+        # Main:
+        # 1) Gemini 4 Hydrogen: 1M in ($1.50) + 2M cache ($0.15) + 1M out ($7.50) = $9.15, cache saved = $2.85
+        # 2) Orchestrator (Carbon) via legacy response slug gemini-pro-orchestrator before Dec 1: 500k in ($1.00) + 100k out ($1.00) = $2.00
+        # 3) Gemini 4 Hydrogen (Orchestrator) via gemini-flash-worker-agy: 1M in ($1.50)
+        main = ConversationDB(main_db_path)
+        self._subagent_step(main, child_id)
+        self._subagent_step(main, missing_id)
+        main.generation(
+            [group(7, 100, ("0: USER_INPUT", 100))],
+            usage=usage(input_tokens=1_000_000, output=1_000_000, cache_read=2_000_000, thinking=400_000),
+            model="gemini-4-hydrogen-xhigh",
+            display_name="",
+        )
+        orch_chat = m(f(4, usage(input_tokens=500_000, output=100_000)), f(19, "gemini-pro-orchestrator"), f(21, "Orchestrator (Carbon)"))
+        main.conn.execute("INSERT INTO gen_metadata (idx, data) VALUES ((SELECT COUNT(*) FROM gen_metadata), ?)", (m(f(1, orch_chat)),))
+        worker_chat = m(f(4, usage(input_tokens=1_000_000, output=0)), f(19, "gemini-flash-worker-agy"), f(21, "Gemini 4 Hydrogen (Orchestrator)"))
+        main.conn.execute("INSERT INTO gen_metadata (idx, data) VALUES ((SELECT COUNT(*) FROM gen_metadata), ?)", (m(f(1, worker_chat)),))
+        main.close()
+
+        r = self._run_json(main_db_path, "--price-date", "2026-11-24")
+        cs = r["cost_stats"]
+        self.assertTrue(cs["estimated"])
+        self.assertEqual(cs["currency"], "USD")
+        self.assertAlmostEqual(cs["main_usd"], 12.65, places=6)
+        self.assertAlmostEqual(cs["subagent_usd"], 23.00, places=6)
+        self.assertAlmostEqual(cs["total_usd"], 35.65, places=6)
+        self.assertAlmostEqual(cs["cache_saved_usd"], 2.85, places=6)
+        self.assertEqual(cs["total_calls"], 5)
+        self.assertEqual(cs["priced_calls"], 5)
+        self.assertEqual(cs["unpriced_calls"], 0)
+        self.assertEqual(cs["subagent_breakdown"]["count"], 2)
+        self.assertEqual(set(cs["subagent_conversation_ids"]), {child_id, grandchild_id})
+
+        by_model = {m_row["model"]: m_row for m_row in r["model_usage"]}
+        self.assertAlmostEqual(by_model["Gemini 4 Hydrogen"]["estimated_cost_usd"], 9.15, places=6)
+        self.assertAlmostEqual(by_model["Orchestrator (Carbon)"]["estimated_cost_usd"], 2.0, places=6)
+        self.assertAlmostEqual(by_model["Gemini 4 Hydrogen (Orchestrator)"]["estimated_cost_usd"], 1.5, places=6)
+
+        cost_by_model = {m_row["model"]: m_row for m_row in cs["by_model"]}
+        self.assertAlmostEqual(cost_by_model["Claude Opus 5.5"]["estimated_cost_usd"], 20.0, places=6)
+        self.assertAlmostEqual(cost_by_model["Gemini 4 Hydrogen"]["estimated_cost_usd"], 9.15, places=6)
+        self.assertAlmostEqual(cost_by_model["Gemini 4 Neon"]["estimated_cost_usd"], 3.0, places=6)
+        self.assertAlmostEqual(cost_by_model["Orchestrator (Carbon)"]["estimated_cost_usd"], 2.0, places=6)
+        self.assertAlmostEqual(cost_by_model["Gemini 4 Hydrogen (Orchestrator)"]["estimated_cost_usd"], 1.5, places=6)
+        self.assertAlmostEqual(
+            sum(m_row["estimated_cost_usd"] for m_row in cs["by_model"] if m_row["estimated_cost_usd"] is not None),
+            cs["total_usd"],
+            places=6,
+        )
+        sub_by_model = {m_row["model"]: m_row for m_row in cs["subagent_by_model"]}
+        self.assertEqual(set(sub_by_model.keys()), {"Claude Opus 5.5", "Gemini 4 Neon"})
+        self.assertAlmostEqual(sub_by_model["Claude Opus 5.5"]["estimated_cost_usd"], 20.0, places=6)
+        self.assertAlmostEqual(sub_by_model["Gemini 4 Neon"]["estimated_cost_usd"], 3.0, places=6)
+        self.assertAlmostEqual(
+            sum(m_row["estimated_cost_usd"] for m_row in cs["subagent_by_model"] if m_row["estimated_cost_usd"] is not None),
+            cs["subagent_usd"],
+            places=6,
+        )
+        self.assertIn("Estimated API cost · $35.65", r["text"])
+        self.assertIn("Scope: main $12.65 (3 calls) · subagents (2) $23.00 (2 calls)", r["text"])
+
+    def test_pricing_schedules_and_prompt_tiers(self):
+        # Verify Dec 1 / Jan 1 rate transitions via per-step timestamps and prompt length thresholds
+        db_path = self.home / "tiered.db"
+        db = ConversationDB(db_path)
+
+        nov30 = 1796040000  # 2026-11-30 UTC (~12:00 UTC)
+        dec02 = 1796212800  # 2026-12-02 UTC (~12:00 UTC)
+
+        # Step 0 (Nov 30) -> Carbon @ $2/$10: 1M in ($2) + 1M out ($10) = $12
+        db.step(USER_INPUT, metadata=f(1, f(1, nov30)), payload_field=P_USER, payload=user_input("nov"))
+        c_nov = m(
+            f(4, usage(input_tokens=1_000_000, output=1_000_000)),
+            f(20, m(f(1, "last_step_index"), f(2, "0"))),
+            f(21, "Gemini 4 Carbon (High)"),
+        )
+        db.conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (?, ?)",
+            (0, m(f(1, c_nov), f(3, f(28, "gemini-4-carbon-high")))),
+        )
+
+        # Step 1 (Dec 2) -> Carbon @ $4/$20: 1M in ($4) + 1M out ($20) = $24
+        db.step(USER_INPUT, metadata=f(1, f(1, dec02)), payload_field=P_USER, payload=user_input("dec"))
+        c_dec = m(
+            f(4, usage(input_tokens=1_000_000, output=1_000_000)),
+            f(20, m(f(1, "last_step_index"), f(2, "1"))),
+            f(21, "Gemini 4 Carbon (High)"),
+        )
+        db.conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (?, ?)",
+            (1, m(f(1, c_dec), f(3, f(28, "gemini-4-carbon-high")))),
+        )
+
+        # Gemini 3.1 Pro prompt <= 200k vs > 200k
+        # 200k in = $0.40, 1M out <=200k = $12 -> $12.40
+        db.generation([group(7, 100, ("0: USER_INPUT", 100))], usage=usage(input_tokens=200_000, output=1_000_000), model="gemini-3.1-pro-preview", display_name="")
+        # 10k in + 200k cache (> 200k total prompt): 10k@$4 ($0.04) + 200k@$0.40 ($0.08) + 1M out@$18 ($18.00) = $18.12
+        db.generation([group(7, 100, ("0: USER_INPUT", 100))], usage=usage(input_tokens=10_000, cache_read=200_000, output=1_000_000), model="gemini-3.1-pro-preview", display_name="")
+
+        # Claude Haiku 5.5 prompt <= 100k vs > 100k
+        # 100k in@$0.10 ($0.01) + 1M out@$0.50 ($0.50) = $0.51
+        db.generation([group(7, 100, ("0: USER_INPUT", 100))], usage=usage(input_tokens=100_000, output=1_000_000), model="claude-haiku-5-5", display_name="")
+        # 200k in@$0.50 ($0.10) + 1M out@$2.50 ($2.50) = $2.60
+        db.generation([group(7, 100, ("0: USER_INPUT", 100))], usage=usage(input_tokens=200_000, output=1_000_000), model="claude-haiku-5-5", display_name="")
+        db.close()
+
+        r = self._run_json(db_path)
+        by_id = {m_row["model_id"]: m_row for m_row in r["model_usage"]}
+        self.assertAlmostEqual(by_id["gemini-4-carbon"]["estimated_cost_usd"], 36.0, places=6)
+        self.assertAlmostEqual(by_id["gemini-3.1-pro-preview"]["estimated_cost_usd"], 30.52, places=6)
+        self.assertAlmostEqual(by_id["claude-haiku-5-5"]["estimated_cost_usd"], 3.11, places=6)
+
+        # Gemini 3.8 Flash explicit date transition: 2026-12-31 ($0.75/$3.75) vs 2027-01-01 ($1.50/$7.50)
+        flash_db_path = self.home / "flash38.db"
+        fdb = ConversationDB(flash_db_path)
+        fdb.generation([group(7, 100, ("0: USER_INPUT", 100))], usage=usage(input_tokens=1_000_000, output=1_000_000), model="gemini-3.8-flash-medium", display_name="")
+        fdb.close()
+        r_2026 = self._run_json(flash_db_path, "--price-date", "2026-12-31")
+        r_2027 = self._run_json(flash_db_path, "--price-date", "2027-01-01")
+        self.assertAlmostEqual(r_2026["cost_stats"]["total_usd"], 4.50, places=6)
+        self.assertAlmostEqual(r_2027["cost_stats"]["total_usd"], 9.00, places=6)
+
+    def test_unpriced_models_handling(self):
+        db_only = self.home / "unpriced_only.db"
+        u1 = ConversationDB(db_only)
+        u1.generation([group(7, 100, ("0: USER_INPUT", 100))], usage=usage(input_tokens=500_000, output=100_000), model="gpt-oss-120b-medium", display_name="")
+        u1.close()
+
+        r1 = self._run_json(db_only, "--price-date", "2026-11-24")
+        self.assertIsNone(r1["cost_stats"]["total_usd"])
+        self.assertEqual(r1["cost_stats"]["priced_calls"], 0)
+        self.assertEqual(r1["cost_stats"]["unpriced_calls"], 1)
+        self.assertEqual(r1["cost_stats"]["unpriced_models"], ["GPT-OSS 120B"])
+        self.assertIsNone(r1["model_usage"][0]["estimated_cost_usd"])
+        self.assertIn("Unpriced calls: 1 (GPT-OSS 120B)", r1["text"])
+
+        db_mix = self.home / "mixed.db"
+        u2 = ConversationDB(db_mix)
+        u2.generation([group(7, 100, ("0: USER_INPUT", 100))], usage=usage(input_tokens=1_000_000, output=0), model="gemini-4-hydrogen-high", display_name="")
+        u2.generation([group(7, 100, ("0: USER_INPUT", 100))], usage=usage(input_tokens=500_000, output=0), model="gpt-oss-120b-medium", display_name="")
+        u2.close()
+
+        r2 = self._run_json(db_mix, "--price-date", "2026-11-24")
+        self.assertAlmostEqual(r2["cost_stats"]["total_usd"], 1.50, places=6)
+        self.assertEqual(r2["cost_stats"]["priced_calls"], 1)
+        self.assertEqual(r2["cost_stats"]["unpriced_calls"], 1)
+
+        bad_res = subprocess.run(
+            [sys.executable, str(SCRIPT), "--db", str(db_mix), "--price-date", "not-a-date"],
+            capture_output=True, text=True, encoding="utf-8",
+        )
+        self.assertNotEqual(bad_res.returncode, 0)
 
 
 if __name__ == "__main__":
