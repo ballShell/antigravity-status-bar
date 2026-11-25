@@ -911,13 +911,6 @@
     const ss = r.speed_stats;
     if (!ss || typeof ss.session_tps !== 'number' || !Number.isFinite(ss.session_tps)) return '';
     const sessionStr = `≈${fmtTps(ss.session_tps)} tok/s`;
-    const subParts = [];
-    if (typeof ss.last_tps === 'number' && Number.isFinite(ss.last_tps) && num(ss.eligible_calls) > 1) {
-      subParts.push(`最近 ≈${fmtTps(ss.last_tps)}`);
-    } else if (typeof ss.first_token_median_ms === 'number' && Number.isFinite(ss.first_token_median_ms)) {
-      subParts.push(`首字 ≈${(ss.first_token_median_ms / 1000).toFixed(1)}s`);
-    }
-    const subHtml = subParts.length ? `<span class="cache-sub-inline"> · ${esc(subParts.join(' · '))}</span>` : '';
     const tipParts = [
       `估算输出速率 (含首字等待，参考 CC Switch 口径: 输出 ≥ 200 tokens 且耗时 ≥ 1s)`,
       `会话均值 ${sessionStr} (${num(ss.eligible_calls)} 次 · ${fmtTok(num(ss.output_tokens))} tok / ${(num(ss.duration_ms) / 1000).toFixed(1)}s)`,
@@ -930,7 +923,7 @@
     }
     return `<div class="row speed-row" title="${esc(tipParts.join(' · '))}">`
       + `<span class="mark" style="background:var(--c-user)"></span>`
-      + `<span>Speed${subHtml}</span>`
+      + `<span>Speed</span>`
       + `<span class="tok num span-end dim">${esc(sessionStr)}</span>`
       + `</div>`;
   }
