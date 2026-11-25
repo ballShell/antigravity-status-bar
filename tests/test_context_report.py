@@ -1214,6 +1214,129 @@ class CostEstimateTest(unittest.TestCase):
         self.assertTrue(cs["incomplete"])
         self.assertEqual(cs["failed_subagent_count"], 1)
 
+    def test_undo_stripped_generation_preserves_limit_and_context_usage(self):
+        # Simulates Antigravity after Undo: the latest gen_metadata row is an older row whose
+        # planner_config (f3) and breakdown (cwm.f3) were stripped, while pre-checkpoint steps
+        # would otherwise sum to >1.5M tokens and limit would fall back to request_budget (512k).
+        db_path = self.home / "undo_case.db"
+        db = ConversationDB(db_path)
+        # Historical pre-checkpoint steps summing to 1.6M tokens
+        db.step(USER_INPUT, payload_field=P_USER, payload=user_input("old prompt"))
+        db.step(PLANNER_RESPONSE, metadata=f(9, usage(100, 1_600_000)), payload_field=P_PLANNER, payload=planner("huge"))
+        db.step(
+            CHECKPOINT,
+            payload_field=P_CHECKPOINT,
+            payload=m(f(1, 2), f(11, 0), f(12, 1), f(4, "Old work"), f(5, "s" * 400)),
+            status=3,
+        )
+        # Active window after checkpoint #2
+        db.step(USER_INPUT, payload_field=P_USER, payload=user_input("a" * 400))  # 100 tok
+        db.step(PLANNER_RESPONSE, metadata=f(9, usage(5000, 300)), payload_field=P_PLANNER, payload=planner("reply"))
+
+        # Stripped gen_metadata: NO field 3 (planner_config) and NO cwm.f3 (breakdown),
+        # only cwm.f1=161_596, cwm.f4=512_000, resp_model='gemini-4-neon', display='Gemini 4 Neon (High)'
+        stripped_cwm = m(f(1, 161_596), f(4, 512_000))
+        stripped_chat = m(
+            f(4, usage(input_tokens=13_266, output=5_318, cache_read=157_943)),
+            f(9, m(f(2, 2), f(10, stripped_cwm))),
+            f(19, "gemini-4-neon"),
+            f(20, m(f(1, "last_step_index"), f(2, "4"))),
+            f(21, "Gemini 4 Neon (High)"),
+        )
+        db.conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (0, ?)", (m(f(1, stripped_chat)),))
+        # Also insert a stale future gen_metadata row ahead of max step idx (4) to test rollback guard
+        stale_chat = m(
+            f(4, usage(input_tokens=999_999, output=100)),
+            f(9, m(f(2, 2), f(10, m(f(1, 999_999), f(4, 512_000))))),
+            f(19, "gemini-4-neon"),
+            f(20, m(f(1, "last_step_index"), f(2, "99"))),
+            f(21, "Gemini 4 Neon (High)"),
+        )
+        db.conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?)", (m(f(1, stale_chat)),))
+        db.close()
+
+        # Without catalog: falls back via response_model to native 1M window (NOT 512k!)
+        r = self._run_json(db_path)
+        self.assertEqual(r["limit_tokens"], 1_048_576)
+        self.assertEqual(r["request_budget_tokens"], 512_000)
+        self.assertEqual(r["used_tokens"], 161_596)
+        self.assertEqual(r["model"], "Gemini 4 Neon (High)")
+        self.assertEqual(r["heading"], "Estimated from latest generation · updates next turn")
+        by_key = {c["key"]: c["tokens"] for c in r["categories"]}
+        self.assertEqual(by_key["user"], 100)
+        self.assertEqual(by_key["agent"], 300 + 102)  # step 4 output (300) + checkpoint summary (len("Old work")+400)//4
+        self.assertEqual(by_key["system_overhead"], 161_596 - (100 + 402))
+
+        # With live catalog keyed by effort slug ('gemini-4-neon-high'): matches via displayName/family
+        cat = self.home / "undo_catalog.json"
+        cat.write_text(json.dumps({
+            "gemini-4-neon-high": {"maxTokens": 1_048_576, "displayName": "Gemini 4 Neon (High)"},
+            "gemini-4-neon-medium": {"maxTokens": 1_048_576, "displayName": "Gemini 4 Neon (Medium)"},
+        }))
+        r_cat = self._run_json(db_path, "--model-catalog", str(cat))
+        self.assertEqual(r_cat["limit_tokens"], 1_048_576)
+        self.assertEqual(r_cat["used_tokens"], 161_596)
+
+    def test_cc_switch_pricing_parity_and_dated_slugs(self):
+        db_path = self.home / "cc_pricing.db"
+        db = ConversationDB(db_path)
+        cases = [
+            ("gemini-3.7-flash-tiered", 1_000_000, 0, 1_000_000),        # 0.75 + 3.75 = 4.50
+            ("gemini-flash-latest", 1_000_000, 0, 1_000_000),            # 0.75 + 3.75 = 4.50
+            ("gemini-pro-orchestrator-g1-pro", 1_000_000, 0, 0),         # argon -> 2.00
+            ("claude-sonnet-4-6-20260217", 1_000_000, 0, 1_000_000),     # 3.00 + 15.00 = 18.00
+            ("claude-opus-4-5-20251101", 1_000_000, 0, 0),               # 5.00
+            ("claude-fable-5-2", 1_000_000, 1_000_000, 0),               # 8.00 + 0.20 = 8.20
+        ]
+        for idx, (slug, inp, cr_tok, out) in enumerate(cases):
+            chat = m(f(4, usage(input_tokens=inp, output=out, cache_read=cr_tok)), f(19, slug))
+            db.conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)", (idx, m(f(1, chat))))
+        db.close()
+
+        r = self._run_json(db_path, "--price-date", "2026-11-25")
+        cs = r["cost_stats"]
+        self.assertEqual(cs["priced_calls"], len(cases))
+        self.assertEqual(cs["unpriced_calls"], 0)
+        self.assertAlmostEqual(cs["total_usd"], 4.50 + 4.50 + 2.00 + 18.00 + 5.00 + 8.20, places=6)
+
+    def test_speed_stats_matches_cc_switch_weighted_estimate(self):
+        def dur(ms: int) -> bytes:
+            return m(f(1, ms // 1000), f(2, (ms % 1000) * 1_000_000))
+
+        db_path = self.home / "speed.db"
+        db = ConversationDB(db_path)
+        rows = [
+            # Eligible #1: out=400, ttft=2000ms, stream=2000ms -> lat=4000ms (100.0 tok/s)
+            m(f(4, usage(input_tokens=100, output=400)), f(11, dur(2000)), f(12, dur(2000))),
+            # Ineligible (out < 200): out=150, ttft=1000ms, stream=1000ms -> excluded from tps, TTFT still recorded
+            m(f(4, usage(input_tokens=100, output=150)), f(11, dur(1000)), f(12, dur(1000))),
+            # Ineligible (lat < 1000ms): out=500, ttft=300ms, stream=500ms -> excluded from tps
+            m(f(4, usage(input_tokens=100, output=500)), f(11, dur(300)), f(12, dur(500))),
+            # Ineligible (missing streaming duration f12): excluded completely
+            m(f(4, usage(input_tokens=100, output=800)), f(11, dur(4000))),
+            # Eligible #2: out=1600, ttft=4000ms, stream=12000ms -> lat=16000ms (100.0 tok/s)
+            m(f(4, usage(input_tokens=100, output=1600)), f(11, dur(4000)), f(12, dur(12000))),
+        ]
+        for idx, chat in enumerate(rows):
+            db.conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)", (idx, m(f(1, chat))))
+        db.close()
+
+        r = self._run_json(db_path)
+        ss = r["speed_stats"]
+        self.assertTrue(ss["estimated"])
+        self.assertEqual(ss["eligible_calls"], 2)
+        self.assertEqual(ss["timed_calls"], 4)
+        # Weighted aggregate: (400 + 1600) / ((4000 + 16000) / 1000) = 2000 / 20 = 100.0 tok/s
+        self.assertEqual(ss["output_tokens"], 2000)
+        self.assertEqual(ss["duration_ms"], 20_000)
+        self.assertAlmostEqual(ss["session_tps"], 100.0, places=1)
+        self.assertAlmostEqual(ss["last_tps"], 100.0, places=1)
+        self.assertEqual(ss["last_output_tokens"], 1600)
+        self.assertEqual(ss["last_latency_ms"], 16_000)
+        self.assertEqual(ss["last_first_token_ms"], 4000)
+        # TTFT samples sorted: [300, 1000, 2000, 4000] -> median = (1000 + 2000) // 2 = 1500
+        self.assertEqual(ss["first_token_median_ms"], 1500)
+
 
 if __name__ == "__main__":
     unittest.main()

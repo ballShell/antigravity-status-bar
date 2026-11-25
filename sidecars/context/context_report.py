@@ -493,6 +493,27 @@ def _checkpoint_request_label(ck: Msg) -> str:
     return ""
 
 
+def _scale_chat_categories(st: dict, target_tokens: int) -> None:
+    """Scale user/agent/tool/system_messages proportionally to sum to target_tokens."""
+    cats_keys = ("user", "agent", "tool", "system_messages")
+    est = sum(st[k] for k in cats_keys)
+    if est <= 0:
+        st["agent"] = target_tokens
+        return
+    raw_scaled = [(k, st[k] * target_tokens / est) for k in cats_keys]
+    floored = {k: int(v) for k, v in raw_scaled}
+    rem = target_tokens - sum(floored.values())
+    if rem > 0:
+        for k, _ in sorted(raw_scaled, key=lambda kv: kv[1] - int(kv[1]), reverse=True):
+            if rem <= 0:
+                break
+            if st[k] > 0:
+                floored[k] += 1
+                rem -= 1
+    for k in cats_keys:
+        st[k] = floored[k]
+
+
 def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> dict:
     st = {k: 0 for k in (
         "user", "agent", "tool", "checkpoint", "system_messages", "system_prompt", "system_tools",
@@ -500,20 +521,39 @@ def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> dict:
         "plugins", "mcp_tools",
     )}
     st["has_breakdown"] = False
+    st["estimated_from_gen"] = False
     st["active_checkpoint"] = -1
     checkpoints, knowledge, artifacts, skill_files = [], [], [], []
     seen_k, seen_a, seen_s = set(), set(), set()
 
     chat = gen.msg(1) if gen is not None else None
     chat_start = chat.msg(9) if chat is not None else None
+    cwm = chat_start.msg(10) if chat_start is not None else None
+    breakdown = cwm.msg(3) if cwm is not None else None
     newer_pos, newer_step = checkpoint_newer_than_generation(steps, chat_start)
     has_newer = newer_step is not None
     st["compacted"] = has_newer
 
+    # When Undo deletes the latest gen_metadata row, the new latest row is an older
+    # generation whose detailed token breakdown (cwm.f3) was already stripped by Antigravity.
+    # If that generation sat after a historical checkpoint (active_ck >= 0), restrict step
+    # estimates to steps after that checkpoint so pre-compaction history is never double-counted.
+    active_ck_id = chat_start.int(2, signed32=True) if (chat_start is not None and chat_start.has(2)) else -1
+    active_ck_pos = -1
+    active_ck_step: Step | None = None
+    if breakdown is None and not has_newer and active_ck_id >= 0:
+        for pos, s in enumerate(steps):
+            ck = s.payload(STEP_CHECKPOINT)
+            if ck is not None and s.status == STATUS_DONE and ck.int(1) == active_ck_id:
+                active_ck_pos = pos
+                active_ck_step = s
+
+    cutoff_pos = newer_pos if has_newer else active_ck_pos
+
     for pos, step in enumerate(steps):
         cat = step_category(step.type)
         tok = step_tokens(step)
-        counted = 0 if has_newer and newer_pos > pos else tok
+        counted = 0 if (cutoff_pos >= 0 and cutoff_pos > pos) else tok
         if cat == CAT_USER:
             st["user"] += counted
         elif cat == CAT_AGENT:
@@ -557,8 +597,6 @@ def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> dict:
                 seen_s.add(uri)
                 skill_files.append((shorten_path(uri), tok))
 
-    cwm = chat_start.msg(10) if chat_start is not None else None
-    breakdown = cwm.msg(3) if cwm is not None else None
     if breakdown is not None:
         st["has_breakdown"] = True
         seen_prompt = seen_tools = False
@@ -611,23 +649,21 @@ def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> dict:
             if ok:
                 st["user"], st["agent"], st["tool"], st["system_messages"] = cats
             else:
-                cats_keys = ("user", "agent", "tool", "system_messages")
-                est = sum(st[k] for k in cats_keys)
-                if est == 0:
-                    st["agent"] = chat_tok
-                else:
-                    raw_scaled = [(k, st[k] * chat_tok / est) for k in cats_keys]
-                    floored = {k: int(v) for k, v in raw_scaled}
-                    rem = chat_tok - sum(floored.values())
-                    if rem > 0:
-                        for k, _ in sorted(raw_scaled, key=lambda kv: kv[1] - int(kv[1]), reverse=True):
-                            if rem <= 0:
-                                break
-                            if st[k] > 0:
-                                floored[k] += 1
-                                rem -= 1
-                    for k in cats_keys:
-                        st[k] = floored[k]
+                _scale_chat_categories(st, chat_tok)
+    elif not has_newer and gen is not None:
+        if active_ck_step is not None:
+            st["agent"] += checkpoint_summary_tokens(active_ck_step)
+        cwm_total = cwm.int(1, signed32=True) if cwm is not None else 0
+        usage = chat.msg(4) if chat is not None else None
+        api_input = (usage.int(2) + usage.int(5)) if usage is not None else 0
+        target_total = cwm_total if cwm_total > 0 else api_input
+        if target_total > 0:
+            st["estimated_from_gen"] = True
+            chat_est = st["user"] + st["agent"] + st["tool"] + st["system_messages"]
+            if chat_est < target_total:
+                st["system_overhead"] = target_total - chat_est
+            elif chat_est > target_total:
+                _scale_chat_categories(st, target_total)
 
     if chat_start is not None and chat_start.has(2):
         st["active_checkpoint"] = chat_start.int(2, signed32=True)
@@ -678,6 +714,8 @@ def stats_heading(st: dict) -> str:
         return "Estimated after compaction · updates next turn"
     if st["has_breakdown"]:
         return "Token usage by category"
+    if st.get("estimated_from_gen"):
+        return "Estimated from latest generation · updates next turn"
     return "Estimated usage (awaiting generation)"
 
 
@@ -1315,6 +1353,101 @@ def collect_output_stats(gens: list[Msg]) -> dict:
     }
 
 
+# Speed estimation thresholds (matching CC Switch's agy_session / usage_stats.rs口径):
+# Antigravity records `chat.msg(11)` (first-token wait) and `chat.msg(12)` (streaming),
+# so total latency = first_token_ms + streaming_ms. Using total latency with >= 200 output
+# tokens and >= 1000 ms avoids artificially inflated rates on buffered/thinking bursts.
+SPEED_ESTIMATE_MIN_OUTPUT_TOKENS = 200
+SPEED_ESTIMATE_MIN_DURATION_MS = 1000
+
+
+def _duration_ms(dur: Msg | None) -> int | None:
+    """Decode google.protobuf.Duration (seconds: int64, nanos: int32) to non-negative milliseconds."""
+    if dur is None or not dur.fields:
+        return None
+    sec = dur.int(1, signed32=True)
+    nanos = dur.int(2, signed32=True)
+    if sec < 0 or nanos < 0 or nanos >= 1_000_000_000:
+        return None
+    return sec * 1000 + nanos // 1_000_000
+
+
+def _gen_timing_ms(gen: Msg) -> tuple[int, int] | None:
+    """Return (latency_ms, first_token_ms) from gen_metadata chat fields 11 and 12."""
+    chat = gen.msg(1)
+    if chat is None:
+        return None
+    first_token_ms = _duration_ms(chat.msg(11))
+    streaming_ms = _duration_ms(chat.msg(12))
+    if first_token_ms is None or streaming_ms is None:
+        return None
+    latency_ms = first_token_ms + streaming_ms
+    if latency_ms <= 0:
+        return None
+    return latency_ms, first_token_ms
+
+
+def _median_int(values: list[int]) -> int | None:
+    if not values:
+        return None
+    s = sorted(values)
+    mid = len(s) // 2
+    if len(s) % 2 == 1:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) // 2
+
+
+def collect_speed_stats(gens: list[Msg]) -> dict:
+    """Compute CC Switch-compatible output speed (tok/s) and TTFT stats from gen_metadata."""
+    eligible_calls = 0
+    timed_calls = 0
+    est_output_tokens = 0
+    est_duration_ms = 0
+    last_tps: float | None = None
+    last_output_tokens = 0
+    last_latency_ms = 0
+    last_first_token_ms: int | None = None
+    ttft_samples: list[int] = []
+
+    for g in gens:
+        chat = g.msg(1)
+        u = chat.msg(4) if chat is not None else None
+        if u is None:
+            continue
+        out = u.int(3)
+        if out <= 0 and u.int(2) + u.int(5) <= 0:
+            continue
+        timing = _gen_timing_ms(g)
+        if timing is None:
+            continue
+        latency_ms, first_token_ms = timing
+        timed_calls += 1
+        ttft_samples.append(first_token_ms)
+        if out >= SPEED_ESTIMATE_MIN_OUTPUT_TOKENS and latency_ms >= SPEED_ESTIMATE_MIN_DURATION_MS:
+            eligible_calls += 1
+            est_output_tokens += out
+            est_duration_ms += latency_ms
+            last_output_tokens = out
+            last_latency_ms = latency_ms
+            last_first_token_ms = first_token_ms
+            last_tps = round(out / (latency_ms / 1000.0), 1)
+
+    session_tps = round(est_output_tokens / (est_duration_ms / 1000.0), 1) if est_duration_ms > 0 else None
+    return {
+        "estimated": True,
+        "eligible_calls": eligible_calls,
+        "timed_calls": timed_calls,
+        "output_tokens": est_output_tokens,
+        "duration_ms": est_duration_ms,
+        "session_tps": session_tps,
+        "last_tps": last_tps,
+        "last_output_tokens": last_output_tokens,
+        "last_latency_ms": last_latency_ms,
+        "last_first_token_ms": last_first_token_ms,
+        "first_token_median_ms": _median_int(ttft_samples),
+    }
+
+
 # --- model usage & API cost estimation ---------------------------------------
 
 # Public API list pricing in USD per 1,000,000 tokens.
@@ -1343,9 +1476,18 @@ MODEL_PRICING: dict[str, tuple[tuple[date | None, tuple[tuple[int | None, dict[s
         (date(2027, 1, 1), ((None, {"input": 1.50, "cache_read": 0.15, "output": 7.50}),)),
         (None, ((None, {"input": 0.75, "cache_read": 0.075, "output": 3.75}),)),
     ),
+    "gemini-3.7-flash": (
+        (None, ((None, {"input": 0.75, "cache_read": 0.075, "output": 3.75}),)),
+    ),
     "gemini-3.6-flash": (
         (date(2027, 1, 1), ((None, {"input": 1.50, "cache_read": 0.15, "output": 7.50}),)),
         (None, ((None, {"input": 0.75, "cache_read": 0.075, "output": 3.75}),)),
+    ),
+    "gemini-flash-latest": (
+        (None, ((None, {"input": 0.75, "cache_read": 0.075, "output": 3.75}),)),
+    ),
+    "gemini-3.5-flash": (
+        (None, ((None, {"input": 1.50, "cache_read": 0.15, "output": 9.00}),)),
     ),
     "gemini-3.5-flash-lite": (
         (None, ((None, {"input": 0.30, "cache_read": 0.03, "output": 2.50}),)),
@@ -1354,6 +1496,15 @@ MODEL_PRICING: dict[str, tuple[tuple[date | None, tuple[tuple[int | None, dict[s
         (None, ((None, {"input": 0.25, "cache_read": 0.025, "output": 1.50}),)),
     ),
     "gemini-3.1-pro": (
+        (
+            None,
+            (
+                (200_000, {"input": 2.00, "cache_read": 0.20, "output": 12.00}),
+                (None, {"input": 4.00, "cache_read": 0.40, "output": 18.00}),
+            ),
+        ),
+    ),
+    "gemini-3-pro": (
         (
             None,
             (
@@ -1383,6 +1534,24 @@ MODEL_PRICING: dict[str, tuple[tuple[date | None, tuple[tuple[int | None, dict[s
     "gemini-2.5-flash-lite": (
         (None, ((None, {"input": 0.10, "cache_read": 0.01, "output": 0.40}),)),
     ),
+    "gemini-2.0-flash": (
+        (None, ((None, {"input": 0.10, "cache_read": 0.025, "output": 0.40}),)),
+    ),
+    "claude-fable-5-2": (
+        (None, ((None, {"input": 8.00, "cache_read": 0.20, "output": 40.00}),)),
+    ),
+    "claude-fable-5-1": (
+        (None, ((None, {"input": 10.00, "cache_read": 0.25, "output": 50.00}),)),
+    ),
+    "claude-fable-5": (
+        (None, ((None, {"input": 10.00, "cache_read": 1.00, "output": 50.00}),)),
+    ),
+    "claude-mythos-5-1": (
+        (None, ((None, {"input": 10.00, "cache_read": 0.25, "output": 50.00}),)),
+    ),
+    "claude-mythos-5": (
+        (None, ((None, {"input": 10.00, "cache_read": 1.00, "output": 50.00}),)),
+    ),
     "claude-opus-5-5": (
         (None, ((None, {"input": 4.00, "cache_read": 0.20, "output": 20.00}),)),
     ),
@@ -1404,6 +1573,12 @@ MODEL_PRICING: dict[str, tuple[tuple[date | None, tuple[tuple[int | None, dict[s
     "claude-opus-4-5": (
         (None, ((None, {"input": 5.00, "cache_read": 0.50, "output": 25.00}),)),
     ),
+    "claude-opus-4-1": (
+        (None, ((None, {"input": 15.00, "cache_read": 1.50, "output": 75.00}),)),
+    ),
+    "claude-opus-4": (
+        (None, ((None, {"input": 15.00, "cache_read": 1.50, "output": 75.00}),)),
+    ),
     "claude-sonnet-5": (
         (None, ((None, {"input": 2.00, "cache_read": 0.20, "output": 10.00}),)),
     ),
@@ -1411,6 +1586,12 @@ MODEL_PRICING: dict[str, tuple[tuple[date | None, tuple[tuple[int | None, dict[s
         (None, ((None, {"input": 3.00, "cache_read": 0.30, "output": 15.00}),)),
     ),
     "claude-sonnet-4-5": (
+        (None, ((None, {"input": 3.00, "cache_read": 0.30, "output": 15.00}),)),
+    ),
+    "claude-sonnet-4": (
+        (None, ((None, {"input": 3.00, "cache_read": 0.30, "output": 15.00}),)),
+    ),
+    "claude-3-5-sonnet": (
         (None, ((None, {"input": 3.00, "cache_read": 0.30, "output": 15.00}),)),
     ),
     "claude-haiku-5-5": (
@@ -1425,6 +1606,9 @@ MODEL_PRICING: dict[str, tuple[tuple[date | None, tuple[tuple[int | None, dict[s
     "claude-haiku-4-5": (
         (None, ((None, {"input": 1.00, "cache_read": 0.10, "output": 5.00}),)),
     ),
+    "claude-3-5-haiku": (
+        (None, ((None, {"input": 0.80, "cache_read": 0.08, "output": 4.00}),)),
+    ),
 }
 
 PRICING_SLUG_ALIASES = {
@@ -1432,13 +1616,16 @@ PRICING_SLUG_ALIASES = {
     "gemini-pro-orchestrator-carbon": "gemini-4-carbon",
     "gemini-pro-orchestrator-neon": "gemini-4-neon",
     "gemini-pro-orchestrator-argon": "gemini-4-argon",
+    "gemini-pro-orchestrator-g1-pro": "gemini-4-argon",
     "gemini-flash-worker-agy": "gemini-4-hydrogen",
     "gemini-4-hydrogen-sonar": "gemini-4-hydrogen",
     "gemini-4-hydrogen-orchestrator": "gemini-4-hydrogen",
+    "gemini-3.8-flash-n": "gemini-3.8-flash",
     "gemini-2.5-flash-thinking": "gemini-2.5-flash",
     "gemini-3.1-pro-preview": "gemini-3.1-pro",
     "gemini-3.1-pro-preview-customtools": "gemini-3.1-pro",
     "gemini-3.1-pro-customtools": "gemini-3.1-pro",
+    "gemini-3-pro-preview": "gemini-3-pro",
     "gemini-3-flash-preview": "gemini-3-flash",
 }
 
@@ -1452,16 +1639,27 @@ PRICING_DISPLAY_ALIASES = {
     "gemini 4 hydrogen": "gemini-4-hydrogen",
     "gemini 4 hydrogen orchestrator": "gemini-4-hydrogen",
     "gemini 3.8 flash": "gemini-3.8-flash",
+    "gemini 3.7 flash": "gemini-3.7-flash",
     "gemini 3.6 flash": "gemini-3.6-flash",
+    "gemini flash latest": "gemini-flash-latest",
+    "gemini 3.5 flash": "gemini-3.5-flash",
     "gemini 3.5 flash lite": "gemini-3.5-flash-lite",
     "gemini 3.1 flash lite": "gemini-3.1-flash-lite",
     "gemini 3.1 pro": "gemini-3.1-pro",
     "gemini 3.1 pro preview": "gemini-3.1-pro",
+    "gemini 3 pro": "gemini-3-pro",
+    "gemini 3 pro preview": "gemini-3-pro",
     "gemini 3 flash": "gemini-3-flash",
     "gemini 3 flash preview": "gemini-3-flash",
     "gemini 2.5 pro": "gemini-2.5-pro",
     "gemini 2.5 flash": "gemini-2.5-flash",
     "gemini 2.5 flash lite": "gemini-2.5-flash-lite",
+    "gemini 2.0 flash": "gemini-2.0-flash",
+    "claude fable 5.2": "claude-fable-5-2",
+    "claude fable 5.1": "claude-fable-5-1",
+    "claude fable 5": "claude-fable-5",
+    "claude mythos 5.1": "claude-mythos-5-1",
+    "claude mythos 5": "claude-mythos-5",
     "claude opus 5.5": "claude-opus-5-5",
     "claude sonnet 5.5": "claude-sonnet-5-5",
     "claude opus 5": "claude-opus-5",
@@ -1469,11 +1667,16 @@ PRICING_DISPLAY_ALIASES = {
     "claude opus 4.7": "claude-opus-4-7",
     "claude opus 4.6": "claude-opus-4-6",
     "claude opus 4.5": "claude-opus-4-5",
+    "claude opus 4.1": "claude-opus-4-1",
+    "claude opus 4": "claude-opus-4",
     "claude sonnet 5": "claude-sonnet-5",
     "claude sonnet 4.6": "claude-sonnet-4-6",
     "claude sonnet 4.5": "claude-sonnet-4-5",
+    "claude sonnet 4": "claude-sonnet-4",
+    "claude 3.5 sonnet": "claude-3-5-sonnet",
     "claude haiku 5.5": "claude-haiku-5-5",
     "claude haiku 4.5": "claude-haiku-4-5",
+    "claude 3.5 haiku": "claude-3-5-haiku",
 }
 
 
@@ -1496,7 +1699,10 @@ def _normalize_pricing_slug(slug: str) -> str:
     if s in MODEL_PRICING:
         return s
     parts = [p for p in s.split("-") if p]
-    while len(parts) > 1 and parts[-1] in (*EFFORT_LEVELS, "tiered", "thinking", "preview", "customtools"):
+    while len(parts) > 1 and (
+        parts[-1] in (*EFFORT_LEVELS, "tiered", "thinking", "preview", "customtools")
+        or (len(parts[-1]) == 8 and parts[-1].isdigit())
+    ):
         candidate = "-".join(parts)
         if candidate in PRICING_SLUG_ALIASES:
             return PRICING_SLUG_ALIASES[candidate]
@@ -2091,11 +2297,38 @@ def collect_session_cost(
 # --- main --------------------------------------------------------------------
 
 
+def _gen_last_step_index(gen: Msg) -> int | None:
+    chat = gen.msg(1)
+    if chat is None:
+        return None
+    for kv in chat.msgs(20):
+        if kv.str(1) == "last_step_index":
+            raw = kv.str(2).strip()
+            if raw.isdigit():
+                return int(raw)
+            return None
+    return None
+
+
+def _select_active_gen(steps: list[Step], gens: list[Msg]) -> Msg | None:
+    """Pick the latest generation that is not ahead of the current step list (e.g., after Undo)."""
+    if not gens:
+        return None
+    if not steps:
+        return gens[-1]
+    max_step_idx = max(s.idx for s in steps)
+    for g in reversed(gens):
+        lsi = _gen_last_step_index(g)
+        if lsi is None or lsi <= max_step_idx:
+            return g
+    return None
+
+
 def _load_db_full(
     db_path: Path,
     catalog: dict | None = None,
     override_date: date | None = None,
-) -> tuple[list[Step], Msg | None, dict, dict, list[dict], dict]:
+) -> tuple[list[Step], Msg | None, dict, dict, list[dict], dict, dict]:
     def _read(conn: sqlite3.Connection):
         conn.execute("BEGIN")
         step_cols = [r[1] for r in conn.execute("PRAGMA table_info(steps)").fetchall()]
@@ -2155,16 +2388,17 @@ def _load_db_full(
     )
     return (
         steps,
-        (gens[-1] if gens else None),
+        _select_active_gen(steps, gens),
         collect_cache_stats(gens),
         collect_output_stats(gens),
         model_usage,
         cost_stats,
+        collect_speed_stats(gens),
     )
 
 
 def load_db(db_path: Path, catalog: dict | None = None) -> tuple[list[Step], Msg | None, dict, dict, list[dict]]:
-    steps, latest_gen, cache_stats, output_stats, model_usage, _ = _load_db_full(db_path, catalog=catalog)
+    steps, latest_gen, cache_stats, output_stats, model_usage, _, _ = _load_db_full(db_path, catalog=catalog)
     return steps, latest_gen, cache_stats, output_stats, model_usage
 
 
@@ -2226,12 +2460,81 @@ def model_name(gen: Msg | None) -> str:
     return "Unknown Model"
 
 
+def _model_slug_candidates(gen: Msg | None) -> tuple[str, ...]:
+    """Ordered model ID candidates for limit/catalog lookup, resilient to stripped planner_config."""
+    if gen is None:
+        return ()
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(val: str) -> None:
+        v = val.strip()
+        if v and v.lower() not in seen:
+            seen.add(v.lower())
+            out.append(v)
+
+    _add(model_id(gen))
+    chat = gen.msg(1)
+    if chat is not None:
+        resp_mid = chat.str(19).strip()
+        if resp_mid:
+            _add(resp_mid)
+            _add(_normalize_pricing_slug(resp_mid))
+        disp = chat.str(21).strip()
+        if disp:
+            _add(_normalize_pricing_display(disp))
+    return tuple(out)
+
+
+def _lookup_catalog_entry(catalog: dict | None, gen: Msg | None) -> dict:
+    """Look up live catalog metadata even when planner_config was stripped (e.g., after Undo)."""
+    if not catalog or gen is None:
+        return {}
+    candidates = _model_slug_candidates(gen)
+    for slug in candidates:
+        raw = catalog.get(slug)
+        if isinstance(raw, dict):
+            return raw
+
+    chat = gen.msg(1)
+    disp = chat.str(21).strip() if chat is not None else ""
+    if disp:
+        disp_lower = disp.lower()
+        exact_matches = [
+            v for v in catalog.values()
+            if isinstance(v, dict) and _safe_str(v.get("displayName")).lower() == disp_lower
+        ]
+        if len(exact_matches) == 1:
+            return exact_matches[0]
+        if exact_matches:
+            maxes = {_safe_max_tokens(v.get("maxTokens")) for v in exact_matches}
+            maxes.discard(0)
+            if len(maxes) == 1:
+                return {"maxTokens": next(iter(maxes)), "displayName": disp}
+
+    # Family-level fallback (e.g. response_model='gemini-4-neon' -> catalog keys 'gemini-4-neon-*')
+    for slug in candidates:
+        fam = base_model_id(slug).lower()
+        if not fam:
+            continue
+        fam_maxes = {
+            _safe_max_tokens(v.get("maxTokens"))
+            for k, v in catalog.items()
+            if isinstance(k, str) and isinstance(v, dict) and base_model_id(k).lower() == fam
+        }
+        fam_maxes.discard(0)
+        if len(fam_maxes) == 1:
+            return {"maxTokens": next(iter(fam_maxes)), "displayName": ""}
+    return {}
+
+
 def context_limit(gen: Msg | None) -> int:
     """The model's native window, like the CLI; else the request budget (max_context_tokens)."""
-    slug = model_id(gen)
-    for prefix, tokens in NATIVE_CONTEXT_WINDOWS:
-        if slug.startswith(prefix):
-            return tokens
+    for slug in _model_slug_candidates(gen):
+        low = slug.lower()
+        for prefix, tokens in NATIVE_CONTEXT_WINDOWS:
+            if low.startswith(prefix):
+                return tokens
     return request_budget(gen)
 
 
@@ -2302,11 +2605,10 @@ def main():
                 catalog = loaded_catalog
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"[status-bar] ignoring invalid model catalog {args.model_catalog}: {exc}", file=sys.stderr)
-    steps, gen, cache_stats, output_stats, model_usage, cost_stats = _load_db_full(
+    steps, gen, cache_stats, output_stats, model_usage, cost_stats, speed_stats = _load_db_full(
         db_path, catalog=catalog, override_date=override_date
     )
-    raw_cat_entry = catalog.get(model_id(gen))
-    catalog_entry = raw_cat_entry if isinstance(raw_cat_entry, dict) else {}
+    catalog_entry = _lookup_catalog_entry(catalog, gen)
     cat_max = _safe_max_tokens(catalog_entry.get("maxTokens"))
     limit = args.limit if args.limit > 0 else cat_max or context_limit(gen)
     st = collect_stats(steps, gen, limit)
@@ -2321,7 +2623,7 @@ def main():
             "grid_segments": grid_segments(st),
             "checkpoint_view": checkpoint_view(st),
             "text": render(st, model, system_files, args.width, False, cost_stats=cost_stats),
-            "model_id": model_id(gen),
+            "model_id": model_id(gen) or ((gen.msg(1).str(19) if gen and gen.msg(1) else "")),
             "request_budget_tokens": request_budget(gen),
             "used_tokens": st["total"],
             "limit_tokens": limit,
@@ -2344,6 +2646,7 @@ def main():
             "background_tasks": extract_background_tasks(steps, db_path=db_path),
             "cache_stats": cache_stats,
             "output_stats": output_stats,
+            "speed_stats": speed_stats,
             "model_usage": model_usage,
             "cost_stats": cost_stats,
         }, indent=2))

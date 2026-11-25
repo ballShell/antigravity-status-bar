@@ -901,6 +901,40 @@
       + `</div>`;
   }
 
+  function fmtTps(tps) {
+    if (tps === null || tps === undefined || !Number.isFinite(Number(tps))) return '-';
+    const n = Number(tps);
+    return n >= 1 ? String(Math.round(n)) : n.toFixed(1);
+  }
+
+  function speedRowHtml(r) {
+    const ss = r.speed_stats;
+    if (!ss || typeof ss.session_tps !== 'number' || !Number.isFinite(ss.session_tps)) return '';
+    const sessionStr = `≈${fmtTps(ss.session_tps)} tok/s`;
+    const subParts = [];
+    if (typeof ss.last_tps === 'number' && Number.isFinite(ss.last_tps) && num(ss.eligible_calls) > 1) {
+      subParts.push(`最近 ≈${fmtTps(ss.last_tps)}`);
+    } else if (typeof ss.first_token_median_ms === 'number' && Number.isFinite(ss.first_token_median_ms)) {
+      subParts.push(`首字 ≈${(ss.first_token_median_ms / 1000).toFixed(1)}s`);
+    }
+    const subHtml = subParts.length ? `<span class="cache-sub-inline"> · ${esc(subParts.join(' · '))}</span>` : '';
+    const tipParts = [
+      `估算输出速率 (含首字等待，参考 CC Switch 口径: 输出 ≥ 200 tokens 且耗时 ≥ 1s)`,
+      `会话均值 ${sessionStr} (${num(ss.eligible_calls)} 次 · ${fmtTok(num(ss.output_tokens))} tok / ${(num(ss.duration_ms) / 1000).toFixed(1)}s)`,
+    ];
+    if (typeof ss.last_tps === 'number' && Number.isFinite(ss.last_tps)) {
+      tipParts.push(`最近一次 ≈${fmtTps(ss.last_tps)} tok/s (${fmtTok(num(ss.last_output_tokens))} tok / ${(num(ss.last_latency_ms) / 1000).toFixed(1)}s)`);
+    }
+    if (typeof ss.first_token_median_ms === 'number' && Number.isFinite(ss.first_token_median_ms)) {
+      tipParts.push(`首字中位数 ≈${(ss.first_token_median_ms / 1000).toFixed(1)}s`);
+    }
+    return `<div class="row speed-row" title="${esc(tipParts.join(' · '))}">`
+      + `<span class="mark" style="background:var(--c-user)"></span>`
+      + `<span>Speed${subHtml}</span>`
+      + `<span class="tok num span-end dim">${esc(sessionStr)}</span>`
+      + `</div>`;
+  }
+
   function categories(r) {
     const conv = r.categories.filter((c) => CONVERSATION[c.key]);
     const rest = r.categories.filter((c) => !CONVERSATION[c.key]);
@@ -914,7 +948,7 @@
     return `<section id="token-usage-section"><h2>Token usage</h2>${contextBarHtml(r)}${note}
       <div class="group">${conv.map(categoryRow).join('')}</div>
       ${rest.length ? `<div class="group">${rest.map(categoryRow).join('')}</div>` : ''}
-      <div class="group">${free}${cacheRowHtml(r)}${outputRowHtml(r)}</div></section>`;
+      <div class="group">${free}${cacheRowHtml(r)}${outputRowHtml(r)}${speedRowHtml(r)}</div></section>`;
   }
 
   function checkpoints(r) {
@@ -1072,6 +1106,13 @@
         const subUsd = num(cs.subagent_usd);
         const subPct = totalUsd > 0 ? (subUsd / totalUsd * 100) : 0;
         const mainUsd = num(cs.main_usd);
+        const mainPct = totalUsd > 0 ? (mainUsd / totalUsd * 100) : 0;
+        const mainTip = `Main session only: ${num(mb.calls)} calls (${fmtUsdExact(mainUsd)}, ${mainPct.toFixed(1)}%) · Input ${fmtUsdExact(mb.input_usd)} / Cache ${fmtUsdExact(mb.cache_read_usd)} / Output ${fmtUsdExact(mb.output_usd)}`;
+        bodyHtml += `<div class="row" title="${esc(mainTip)}">`
+          + `<span class="mark sq" style="background:var(--c-user)"></span>`
+          + `<span class="dim">Main</span>`
+          + `<span class="tok num span-end dim">${esc(fmtUsd(mainUsd))}</span>`
+          + `</div>`;
         const subTip = `Main: ${num(mb.calls)} calls (${fmtUsdExact(mainUsd)}) · Subagents (${subCount}): ${subCalls} calls (${fmtUsdExact(subUsd)}, ${subPct.toFixed(1)}%)`;
         bodyHtml += costDisclosureHtml({
           toggleId: 'cost-sub-toggle',
