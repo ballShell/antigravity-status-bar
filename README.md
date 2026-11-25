@@ -48,6 +48,13 @@ git clone https://github.com/ballShell/antigravity-status-bar.git "$HOME\.gemini
 
 安装后重启 Antigravity（或进入 **Customizations → Installed** 开启 **Antigravity 状态栏**），即可在右侧辅助栏 `+` 菜单中打开。
 
+## 贡献者
+
+感谢以下贡献者对本项目的改进与支持：
+
+- [@2502329959](https://github.com/2502329959) — 修复无 `-shm` 文件时 WAL 模式数据库的只读打开兼容（[#2](https://github.com/ballShell/antigravity-status-bar/pull/2)）
+- [@lenkel](https://github.com/lenkel) — 贡献 Windows 多版本 Sidecar 与解析器兼容适配（[#3](https://github.com/ballShell/antigravity-status-bar/pull/3)）
+
 ## 致谢
 
 本项目 Fork 自 [dimitr-io/antigravity-desktop-context](https://github.com/dimitr-io/antigravity-desktop-context)，由衷感谢原作者在 Antigravity 会话库 Protobuf 解析、实时模型目录同步与 Sidecar 面板架构上的扎实工作。

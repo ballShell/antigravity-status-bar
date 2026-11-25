@@ -46,6 +46,13 @@ git clone https://github.com/ballShell/antigravity-status-bar.git "$HOME\.gemini
 
 After cloning, restart Antigravity (or toggle **Antigravity 状态栏** on in **Customizations → Installed**) and open it from the `+` menu in the right-side auxiliary pane.
 
+## Contributors
+
+Thanks to the following contributors for improving this project:
+
+- [@2502329959](https://github.com/2502329959) — Fixed read-only opening of WAL-mode SQLite databases without `-shm` ([#2](https://github.com/ballShell/antigravity-status-bar/pull/2))
+- [@lenkel](https://github.com/lenkel) — Contributed multi-version Windows compatibility for the sidecar and parser ([#3](https://github.com/ballShell/antigravity-status-bar/pull/3))
+
 ## Acknowledgements
 
 Forked from [dimitr-io/antigravity-desktop-context](https://github.com/dimitr-io/antigravity-desktop-context). Special thanks to the original author for the SQLite/Protobuf trajectory parser, live model catalog integration, and Sidecar panel foundation.
